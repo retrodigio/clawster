@@ -1,0 +1,33 @@
+{
+  "name": "clawster",
+  "version": "0.1.0",
+  "description": "Autonomous AI agent orchestrator — run Claude Code agents via Telegram",
+  "type": "module",
+  "bin": {
+    "clawster": "./src/cli/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/core/server.ts",
+    "dev": "bun run --watch src/core/server.ts",
+    "build": "tsup",
+    "clawster": "bun run src/cli/index.ts",
+    "migrate:workspaces": "bun run scripts/migrate-workspaces.ts",
+    "migrate:memory": "bun run scripts/migrate-memory.ts"
+  },
+  "keywords": ["ai", "agents", "claude", "telegram", "orchestrator", "cli"],
+  "author": "Chris Crabtree",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/retrodigio/clawster.git"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "tsup": "^8.5.1",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "commander": "^14.0.3",
+    "grammy": "^1.42.0"
+  }
+}

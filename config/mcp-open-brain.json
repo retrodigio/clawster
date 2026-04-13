@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "open-brain": {
+      "type": "url",
+      "url": "http://localhost:3577/mcp"
+    }
+  }
+}
