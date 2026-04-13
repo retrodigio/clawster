@@ -12,6 +12,25 @@ const PLIST_PATH = join(LAUNCH_AGENTS_DIR, PLIST_NAME);
 
 function generatePlist(bunPath: string, cliPath: string, home: string): string {
   const logsDir = join(home, "logs");
+  const userHome = homedir();
+  // Build a comprehensive PATH that includes all common binary locations
+  const pathDirs = new Set<string>();
+  // Add directories of detected binaries
+  pathDirs.add(join(userHome, ".local", "bin")); // claude CLI
+  pathDirs.add(join(userHome, ".bun", "bin"));   // bun
+  // Add standard system paths
+  pathDirs.add("/usr/local/bin");
+  pathDirs.add("/usr/bin");
+  pathDirs.add("/bin");
+  // Add node paths
+  pathDirs.add("/usr/local/opt/node@22/bin");
+  pathDirs.add(join(userHome, ".nvm", "versions", "node")); // nvm
+  // Add the directory of the detected bun binary
+  const bunDir = bunPath.substring(0, bunPath.lastIndexOf("/"));
+  if (bunDir) pathDirs.add(bunDir);
+
+  const pathString = [...pathDirs].join(":");
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -27,6 +46,13 @@ function generatePlist(bunPath: string, cliPath: string, home: string): string {
   </array>
   <key>WorkingDirectory</key>
   <string>${home}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${pathString}</string>
+    <key>HOME</key>
+    <string>${userHome}</string>
+  </dict>
   <key>KeepAlive</key>
   <true/>
   <key>RunAtLoad</key>
