@@ -29,6 +29,13 @@ function createSemaphore(max: number) {
   return { acquire, release };
 }
 
+// Track running processes per agent so we can interrupt them
+interface RunningProcess {
+  proc: ReturnType<typeof Bun.spawn>;
+  sessionId: string | null;
+  agentKey: string;
+}
+
 export function createAgentRunner(options: {
   maxConcurrent: number;
   mcpConfigPath: string;
@@ -37,21 +44,53 @@ export function createAgentRunner(options: {
   const { maxConcurrent, mcpConfigPath, claudePath } = options;
   const semaphore = createSemaphore(maxConcurrent);
   const agentMutex = new Map<string, Promise<void>>();
+  const activeProcesses = new Map<string, RunningProcess>();
 
+  function getAgentKey(agentId: string, topicId?: number): string {
+    return topicId ? `${agentId}-topic-${topicId}` : agentId;
+  }
+
+  /**
+   * Interrupt a running process for an agent/topic.
+   * Sends SIGINT, waits for exit, returns the session ID for resume.
+   */
+  async function interruptIfRunning(agentKey: string): Promise<string | null> {
+    const running = activeProcesses.get(agentKey);
+    if (!running) return null;
+
+    log.info(running.agentKey, "Interrupting running process for new message", {
+      sessionId: running.sessionId,
+    });
+
+    try {
+      running.proc.kill("SIGINT");
+      await running.proc.exited;
+    } catch {
+      // Process may have already exited
+    }
+
+    activeProcesses.delete(agentKey);
+    return running.sessionId;
+  }
+
+  /**
+   * Non-streaming run — used by scheduler/heartbeats.
+   * Now properly extracts and saves session IDs via stream-json.
+   */
   async function run(
     agent: AgentConfig,
     prompt: string,
     runOptions?: { topicId?: number; timeout?: number },
   ): Promise<string> {
     const timeout = runOptions?.timeout ?? 300_000;
+    const agentKey = getAgentKey(agent.id, runOptions?.topicId);
 
-    // Per-agent mutex: chain promises so only one claude process per agent
-    const prev = agentMutex.get(agent.id) ?? Promise.resolve();
+    const prev = agentMutex.get(agentKey) ?? Promise.resolve();
     let releaseMutex: () => void;
     const mutexPromise = new Promise<void>((resolve) => {
       releaseMutex = resolve;
     });
-    agentMutex.set(agent.id, prev.then(() => mutexPromise));
+    agentMutex.set(agentKey, prev.then(() => mutexPromise));
 
     await prev;
 
@@ -60,17 +99,20 @@ export function createAgentRunner(options: {
 
       try {
         const { getSession, saveSession } = await import("./session-store.ts");
-
         const session = await getSession(agent.id, runOptions?.topicId);
 
-        const args: string[] = [claudePath, "-p", prompt, "--output-format", "text"];
+        const args: string[] = [
+          claudePath, "-p", prompt,
+          "--output-format", "stream-json",
+          "--verbose",
+        ];
 
         if (mcpConfigPath) {
           args.push("--mcp-config", mcpConfigPath);
         }
 
         if (session?.sessionId) {
-          args.push("--resume", session.sessionId);
+          args.push("--resume", session.sessionId, "--fork-session");
         }
 
         log.info(agent.id, "Spawning claude process", {
@@ -93,14 +135,53 @@ export function createAgentRunner(options: {
         }, timeout);
 
         try {
-          const stdoutText = await new Response(proc.stdout).text();
+          // Parse stream-json to extract session ID and result
+          let sessionId: string | null = session?.sessionId ?? null;
+          let resultText = "";
+
+          const reader = proc.stdout.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() ?? "";
+
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              try {
+                const parsed = JSON.parse(line);
+                if (parsed.type === "system" && parsed.subtype === "init" && parsed.session_id) {
+                  sessionId = parsed.session_id;
+                }
+                if (parsed.type === "result") {
+                  resultText = parsed.result ?? "";
+                  if (parsed.session_id) sessionId = parsed.session_id;
+                }
+              } catch {
+                // Skip unparseable lines
+              }
+            }
+          }
+
           const stderrText = await new Response(proc.stderr).text();
           const exitCode = await proc.exited;
-
           clearTimeout(timer);
 
           if (timedOut) {
             log.error(agent.id, "Claude process timed out", { timeout });
+            // Still save session ID if we got one — allows resume after timeout
+            if (sessionId && sessionId !== session?.sessionId) {
+              await saveSession(agent.id, {
+                sessionId,
+                lastActivity: new Date().toISOString(),
+                lastHeartbeat: session?.lastHeartbeat ?? null,
+                messageCount: session?.messageCount ?? 0,
+              }, runOptions?.topicId);
+            }
             return "Sorry, the request timed out. Please try again with a simpler question.";
           }
 
@@ -126,21 +207,20 @@ export function createAgentRunner(options: {
             return "Something went wrong processing your message. Please try again.";
           }
 
-          // Parse session ID from stdout — claude outputs it on resume-capable runs
-          // Update session on success
-          const updatedSession = {
-            sessionId: session?.sessionId ?? null,
+          // Save session ID for future resume
+          await saveSession(agent.id, {
+            sessionId,
             lastActivity: new Date().toISOString(),
             lastHeartbeat: session?.lastHeartbeat ?? null,
             messageCount: (session?.messageCount ?? 0) + 1,
-          };
-          await saveSession(agent.id, updatedSession, runOptions?.topicId);
+          }, runOptions?.topicId);
 
           log.info(agent.id, "Claude process completed", {
-            messageCount: updatedSession.messageCount,
+            sessionId: sessionId?.slice(0, 12),
+            messageCount: (session?.messageCount ?? 0) + 1,
           });
 
-          return stdoutText.trim();
+          return resultText.trim();
         } catch (err) {
           clearTimeout(timer);
           throw err;
@@ -153,6 +233,12 @@ export function createAgentRunner(options: {
     }
   }
 
+  /**
+   * Streaming run — used by text message handler.
+   * Supports interruption: if a new message arrives while this is running,
+   * the bot can call interruptIfRunning() to SIGINT this process,
+   * then resume with the new message using the captured session ID.
+   */
   async function runStreaming(
     agent: AgentConfig,
     prompt: string,
@@ -160,14 +246,17 @@ export function createAgentRunner(options: {
     runOptions?: { topicId?: number; timeout?: number },
   ): Promise<{ text: string; sessionId: string | null }> {
     const timeout = runOptions?.timeout ?? 300_000;
+    const agentKey = getAgentKey(agent.id, runOptions?.topicId);
 
-    // Per-agent mutex: chain promises so only one claude process per agent
-    const prev = agentMutex.get(agent.id) ?? Promise.resolve();
+    // Interrupt any running process for this agent/topic
+    const interruptedSessionId = await interruptIfRunning(agentKey);
+
+    const prev = agentMutex.get(agentKey) ?? Promise.resolve();
     let releaseMutex: () => void;
     const mutexPromise = new Promise<void>((resolve) => {
       releaseMutex = resolve;
     });
-    agentMutex.set(agent.id, prev.then(() => mutexPromise));
+    agentMutex.set(agentKey, prev.then(() => mutexPromise));
 
     await prev;
 
@@ -176,8 +265,11 @@ export function createAgentRunner(options: {
 
       try {
         const { getSession, saveSession } = await import("./session-store.ts");
-
         const session = await getSession(agent.id, runOptions?.topicId);
+
+        // Use interrupted session ID if we just killed a running process,
+        // otherwise use the persisted session ID
+        const resumeSessionId = interruptedSessionId ?? session?.sessionId ?? null;
 
         const args: string[] = [
           claudePath, "-p", prompt,
@@ -190,12 +282,13 @@ export function createAgentRunner(options: {
           args.push("--mcp-config", mcpConfigPath);
         }
 
-        if (session?.sessionId) {
-          args.push("--resume", session.sessionId);
+        if (resumeSessionId) {
+          args.push("--resume", resumeSessionId, "--fork-session");
         }
 
         log.info(agent.id, "Spawning claude streaming process", {
-          hasSession: !!session?.sessionId,
+          hasSession: !!resumeSessionId,
+          interrupted: !!interruptedSessionId,
           timeout,
         });
 
@@ -206,6 +299,14 @@ export function createAgentRunner(options: {
           env: { ...process.env },
         });
 
+        // Track this process so it can be interrupted
+        const runningProcess: RunningProcess = {
+          proc,
+          sessionId: resumeSessionId,
+          agentKey,
+        };
+        activeProcesses.set(agentKey, runningProcess);
+
         let timedOut = false;
         const timer = setTimeout(() => {
           timedOut = true;
@@ -215,7 +316,7 @@ export function createAgentRunner(options: {
 
         try {
           let accumulated = "";
-          let sessionId: string | null = session?.sessionId ?? null;
+          let sessionId: string | null = resumeSessionId;
           let resultText: string | null = null;
           let lastUpdateTime = 0;
 
@@ -237,6 +338,8 @@ export function createAgentRunner(options: {
 
                 if (parsed.type === "system" && parsed.subtype === "init" && parsed.session_id) {
                   sessionId = parsed.session_id;
+                  // Update the running process record with new session ID
+                  runningProcess.sessionId = sessionId;
                 }
 
                 if (parsed.type === "stream_event") {
@@ -263,6 +366,9 @@ export function createAgentRunner(options: {
             }
           }
 
+          // Remove from active processes
+          activeProcesses.delete(agentKey);
+
           // Final update with complete text
           const finalText = resultText ?? accumulated;
           if (finalText) {
@@ -276,6 +382,15 @@ export function createAgentRunner(options: {
 
           if (timedOut) {
             log.error(agent.id, "Claude streaming process timed out", { timeout });
+            // Still save session for resume
+            if (sessionId) {
+              await saveSession(agent.id, {
+                sessionId,
+                lastActivity: new Date().toISOString(),
+                lastHeartbeat: session?.lastHeartbeat ?? null,
+                messageCount: session?.messageCount ?? 0,
+              }, runOptions?.topicId);
+            }
             return {
               text: "Sorry, the request timed out. Please try again with a simpler question.",
               sessionId,
@@ -307,21 +422,23 @@ export function createAgentRunner(options: {
             };
           }
 
-          const updatedSession = {
+          // Save session ID for future resume
+          await saveSession(agent.id, {
             sessionId,
             lastActivity: new Date().toISOString(),
             lastHeartbeat: session?.lastHeartbeat ?? null,
             messageCount: (session?.messageCount ?? 0) + 1,
-          };
-          await saveSession(agent.id, updatedSession, runOptions?.topicId);
+          }, runOptions?.topicId);
 
           log.info(agent.id, "Claude streaming process completed", {
-            messageCount: updatedSession.messageCount,
+            sessionId: sessionId?.slice(0, 12),
+            messageCount: (session?.messageCount ?? 0) + 1,
           });
 
           return { text: finalText.trim(), sessionId };
         } catch (err) {
           clearTimeout(timer);
+          activeProcesses.delete(agentKey);
           throw err;
         }
       } finally {
