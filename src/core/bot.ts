@@ -5,6 +5,8 @@ import { sendResponse } from "./message-sender.ts";
 import { parseIntents, processIntents } from "./intent-parser.ts";
 import { log } from "./logger.ts";
 import { transcribe } from "./transcribe.ts";
+import { registerTopic, getRouterState } from "./router.ts";
+import { findMatchingProject, createAgentFromMatch, createNewProject } from "./discovery.ts";
 import { writeFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -24,6 +26,11 @@ interface CreateBotOptions {
 export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runner, agentById }: CreateBotOptions) {
   const bot = new Bot(botToken);
 
+  // Track chats currently in onboarding so we don't trigger discovery multiple times
+  const onboardingChats = new Set<string>();
+  // Track chats that the user declined to create projects for — route to Zero
+  const declinedChats = new Set<string>();
+
   // Auth middleware — only allowed user can interact
   bot.use(async (ctx, next) => {
     if (ctx.from?.id.toString() !== allowedUserId) {
@@ -33,17 +40,69 @@ export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runn
     await next();
   });
 
+  /**
+   * Handle onboarding: send message to Zero, parse response for intents,
+   * and either create the project or continue the conversation.
+   * Returns the response text to send to the user in the group.
+   */
+  async function handleOnboarding(chatId: string, chatTitle: string, userMessage: string, isFirstMessage: boolean): Promise<string> {
+    const { defaultAgent: zero } = getRouterState();
+
+    let prompt: string;
+    if (isFirstMessage) {
+      prompt = `[NEW GROUP DETECTED — ONBOARDING]
+
+A message arrived from Telegram group "${chatTitle}" (chat ID: ${chatId}).
+No matching project was found in ~/projects/.
+
+User's message: "${userMessage}"
+
+Help Chris set up a project for this group. Ask briefly:
+1. What is this project about?
+2. Confirm the project name (suggest: "${chatTitle}")
+
+When you have enough info, include this block in your response:
+
+[CREATE_PROJECT]
+name: ProjectName
+description: Brief description
+[/CREATE_PROJECT]
+
+If Chris doesn't want a project for this group, include: [SKIP_PROJECT]
+
+Keep it conversational — this is Telegram.`;
+    } else {
+      prompt = `[ONBOARDING CONTINUED — "${chatTitle}" (${chatId})]
+
+Chris replied: "${userMessage}"
+
+Continue the onboarding conversation. When ready, include the structured block:
+
+[CREATE_PROJECT]
+name: ProjectName
+description: Brief description
+[/CREATE_PROJECT]
+
+Or if Chris declines: [SKIP_PROJECT]`;
+    }
+
+    const { text } = await runner.runStreaming(zero, prompt, () => {});
+    return text;
+  }
+
   // Helper to resolve topic name from config or Telegram metadata
   function resolveTopicName(agent: AgentConfig, topicId: number | undefined, ctx: any): string | undefined {
     if (!topicId) return undefined;
     const fromConfig = agent.topics?.[topicId.toString()]?.name;
     if (fromConfig) return fromConfig;
-    // Telegram sometimes includes topic info in the reply_to_message
+    // Telegram includes forum_topic_created in reply_to_message for topic messages
     const replyMsg = ctx.message?.reply_to_message;
     if (replyMsg?.forum_topic_created?.name) {
       return replyMsg.forum_topic_created.name;
     }
-    return undefined;
+    // General topic (ID 1) doesn't include forum_topic_created
+    if (topicId === 1) return "General";
+    return `Topic ${topicId}`;
   }
 
   // Text message handler
@@ -54,15 +113,98 @@ export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runn
     const chatTitle = "title" in ctx.chat ? ctx.chat.title : "DM";
     log.info("orchestrator", "Message received", { chatId, chatTitle, chatType: ctx.chat.type, isPrivate });
 
-    const agent = resolveAgent(chatId, isPrivate);
+    let agent = resolveAgent(chatId, isPrivate);
 
+    // Unknown chat — try auto-discovery
     if (!agent) {
-      log.warn("orchestrator", "No agent found for chat", { chatId });
-      return;
+      const topicId = ctx.message.message_thread_id;
+
+      try {
+        await ctx.replyWithChatAction("typing");
+        const typingInterval = setInterval(() => {
+          ctx.replyWithChatAction("typing").catch(() => {});
+        }, 5000);
+
+        try {
+          const { chatIdToAgent, agentsConfig, defaultAgent } = getRouterState();
+
+          // Already declined — route to Zero silently
+          if (declinedChats.has(chatId)) {
+            agent = defaultAgent;
+          } else {
+            // Step 1: Try name-matching against ~/projects/
+            const match = findMatchingProject(chatTitle ?? "", agentsConfig.agents);
+
+            if (match) {
+              log.info("discovery", "Name-matched group to project", {
+                groupName: chatTitle,
+                project: match.path,
+                score: match.score,
+              });
+              agent = await createAgentFromMatch(chatId, chatTitle ?? match.dirName, match.path, agentsConfig, chatIdToAgent);
+              agentById.set(agent.id, agent);
+              await sendResponse(ctx, `Linked this group to project "${agent.name}" (${agent.workspace}). Processing your message...`, topicId);
+            } else {
+              // Step 2: No match — onboard via Zero
+              const isFirstMessage = !onboardingChats.has(chatId);
+              onboardingChats.add(chatId);
+
+              log.info("discovery", "Onboarding via Zero", { chatId, groupName: chatTitle, isFirstMessage });
+
+              const zeroResponse = await handleOnboarding(chatId, chatTitle ?? "unknown", ctx.message.text, isFirstMessage);
+
+              // Check for CREATE_PROJECT intent
+              const createMatch = zeroResponse.match(/\[CREATE_PROJECT\]\s*\n?name:\s*(.+)\n?description:\s*(.+)\n?\[\/CREATE_PROJECT\]/i);
+              const skipMatch = zeroResponse.includes("[SKIP_PROJECT]");
+
+              if (createMatch) {
+                const projectName = createMatch[1]!.trim();
+                const description = createMatch[2]!.trim();
+                agent = await createNewProject(chatId, projectName, agentsConfig, chatIdToAgent, description);
+                agentById.set(agent.id, agent);
+                onboardingChats.delete(chatId);
+
+                const cleanResponse = zeroResponse.replace(/\[CREATE_PROJECT\][\s\S]*?\[\/CREATE_PROJECT\]/i, "").trim();
+                await sendResponse(ctx, cleanResponse || `Project "${projectName}" created at ~/projects/${agent.id}/. You're live!`, topicId);
+                // Don't process the original message as a normal query — onboarding is done
+                return;
+              }
+
+              if (skipMatch) {
+                declinedChats.add(chatId);
+                onboardingChats.delete(chatId);
+                const cleanResponse = zeroResponse.replace("[SKIP_PROJECT]", "").trim();
+                await sendResponse(ctx, cleanResponse || "Got it, routing messages here to the default agent.", topicId);
+                return;
+              }
+
+              // Zero asked a follow-up — send to user and wait for next message
+              const cleanResponse = zeroResponse
+                .replace(/\[CREATE_PROJECT\][\s\S]*?\[\/CREATE_PROJECT\]/i, "")
+                .replace("[SKIP_PROJECT]", "")
+                .trim();
+              if (cleanResponse) {
+                await sendResponse(ctx, cleanResponse, topicId);
+              }
+              return;
+            }
+          }
+        } finally {
+          clearInterval(typingInterval);
+        }
+      } catch (err) {
+        log.error("discovery", "Auto-discovery failed", { error: String(err), chatId });
+        return;
+      }
     }
 
     const topicId = ctx.message.message_thread_id;
     const topicName = resolveTopicName(agent, topicId, ctx);
+
+    // Auto-register new topics for known agents
+    if (topicId && topicName && !agent.topics?.[topicId.toString()]) {
+      await registerTopic(agent, topicId, topicName);
+    }
 
     log.info("orchestrator", "Routed to agent", { chatId, agentId: agent.id, topicId: topicId ?? null, topicName: topicName ?? null });
 
@@ -146,15 +288,27 @@ export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runn
   bot.on("message:photo", async (ctx) => {
     const chatId = ctx.chat.id.toString();
     const isPrivate = ctx.chat.type === "private";
-    const agent = resolveAgent(chatId, isPrivate);
+    const chatTitle = "title" in ctx.chat ? ctx.chat.title : "DM";
+    let agent = resolveAgent(chatId, isPrivate);
 
     if (!agent) {
-      log.debug("orchestrator", "No agent found for chat", { chatId });
-      return;
+      // For photos, just try name-match — don't start full onboarding
+      const { chatIdToAgent, agentsConfig, defaultAgent } = getRouterState();
+      const match = findMatchingProject(chatTitle ?? "", agentsConfig.agents);
+      if (match) {
+        agent = await createAgentFromMatch(chatId, chatTitle ?? match.dirName, match.path, agentsConfig, chatIdToAgent);
+        agentById.set(agent.id, agent);
+      } else {
+        agent = defaultAgent;
+      }
     }
 
     const topicId = ctx.message.message_thread_id;
-    const topicName = agent.topics?.[topicId?.toString() ?? ""]?.name;
+    const topicName = resolveTopicName(agent, topicId, ctx);
+
+    if (topicId && topicName && !agent.topics?.[topicId.toString()]) {
+      await registerTopic(agent, topicId, topicName);
+    }
 
     const messageContext: MessageContext = {
       agentId: agent.id,
@@ -242,15 +396,27 @@ export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runn
   bot.on("message:voice", async (ctx) => {
     const chatId = ctx.chat.id.toString();
     const isPrivate = ctx.chat.type === "private";
-    const agent = resolveAgent(chatId, isPrivate);
+    const chatTitle = "title" in ctx.chat ? ctx.chat.title : "DM";
+    let agent = resolveAgent(chatId, isPrivate);
 
     if (!agent) {
-      log.debug("orchestrator", "No agent found for chat", { chatId });
-      return;
+      // For voice, just try name-match — don't start full onboarding
+      const { chatIdToAgent, agentsConfig, defaultAgent } = getRouterState();
+      const match = findMatchingProject(chatTitle ?? "", agentsConfig.agents);
+      if (match) {
+        agent = await createAgentFromMatch(chatId, chatTitle ?? match.dirName, match.path, agentsConfig, chatIdToAgent);
+        agentById.set(agent.id, agent);
+      } else {
+        agent = defaultAgent;
+      }
     }
 
     const topicId = ctx.message.message_thread_id;
     const topicName = resolveTopicName(agent, topicId, ctx);
+
+    if (topicId && topicName && !agent.topics?.[topicId.toString()]) {
+      await registerTopic(agent, topicId, topicName);
+    }
 
     const messageContext: MessageContext = {
       agentId: agent.id,

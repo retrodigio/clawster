@@ -1,31 +1,43 @@
 import { Command } from "commander";
 import { existsSync } from "fs";
-import { mkdir, unlink } from "fs/promises";
-import { homedir } from "os";
+import { mkdir, unlink, writeFile } from "fs/promises";
+import { homedir, platform } from "os";
 import { join } from "path";
 import { getClawsterHome } from "../core/config.ts";
 
 const LABEL = "com.clawster.daemon";
 const PLIST_NAME = `${LABEL}.plist`;
-const LAUNCH_AGENTS_DIR = join(homedir(), "Library", "LaunchAgents");
-const PLIST_PATH = join(LAUNCH_AGENTS_DIR, PLIST_NAME);
+const SYSTEMD_SERVICE = "clawster.service";
+
+function isLinux(): boolean {
+  return platform() === "linux";
+}
+
+function isMac(): boolean {
+  return platform() === "darwin";
+}
+
+// --- macOS launchd ---
+
+function getLaunchAgentsDir(): string {
+  return join(homedir(), "Library", "LaunchAgents");
+}
+
+function getPlistPath(): string {
+  return join(getLaunchAgentsDir(), PLIST_NAME);
+}
 
 function generatePlist(bunPath: string, cliPath: string, home: string): string {
   const logsDir = join(home, "logs");
   const userHome = homedir();
-  // Build a comprehensive PATH that includes all common binary locations
   const pathDirs = new Set<string>();
-  // Add directories of detected binaries
-  pathDirs.add(join(userHome, ".local", "bin")); // claude CLI
-  pathDirs.add(join(userHome, ".bun", "bin"));   // bun
-  // Add standard system paths
+  pathDirs.add(join(userHome, ".local", "bin"));
+  pathDirs.add(join(userHome, ".bun", "bin"));
   pathDirs.add("/usr/local/bin");
   pathDirs.add("/usr/bin");
   pathDirs.add("/bin");
-  // Add node paths
   pathDirs.add("/usr/local/opt/node@22/bin");
-  pathDirs.add(join(userHome, ".nvm", "versions", "node")); // nvm
-  // Add the directory of the detected bun binary
+  pathDirs.add(join(userHome, ".nvm", "versions", "node"));
   const bunDir = bunPath.substring(0, bunPath.lastIndexOf("/"));
   if (bunDir) pathDirs.add(bunDir);
 
@@ -67,88 +79,233 @@ function generatePlist(bunPath: string, cliPath: string, home: string): string {
 </plist>`;
 }
 
-export const daemonCommand = new Command("daemon").description(
-  "Manage the Clawster launchd daemon"
-);
+async function installLaunchd() {
+  const home = getClawsterHome();
 
-// clawster daemon install
-daemonCommand
-  .command("install")
-  .description("Install the launchd daemon")
-  .action(async () => {
-    const home = getClawsterHome();
+  const whichProc = Bun.spawn(["which", "bun"], { stdout: "pipe" });
+  const bunPath = (await new Response(whichProc.stdout).text()).trim();
+  await whichProc.exited;
+  if (!bunPath) {
+    console.error("Could not find bun in PATH.");
+    process.exit(1);
+  }
 
-    // Detect bun path
-    const whichProc = Bun.spawn(["which", "bun"], { stdout: "pipe" });
-    const bunPath = (await new Response(whichProc.stdout).text()).trim();
-    await whichProc.exited;
-    if (!bunPath) {
-      console.error("Could not find bun in PATH.");
-      process.exit(1);
-    }
+  const cliPath = join(import.meta.dir, "index.ts");
 
-    // CLI entry point path
-    const cliPath = join(import.meta.dir, "index.ts");
+  await mkdir(join(home, "logs"), { recursive: true });
+  await mkdir(getLaunchAgentsDir(), { recursive: true });
 
-    // Ensure logs directory exists
-    await mkdir(join(home, "logs"), { recursive: true });
+  const plist = generatePlist(bunPath, cliPath, home);
+  await Bun.write(getPlistPath(), plist);
+  console.log(`Plist written to ${getPlistPath()}`);
 
-    // Ensure LaunchAgents directory exists
-    await mkdir(LAUNCH_AGENTS_DIR, { recursive: true });
+  const uid = process.getuid?.() ?? 501;
+  const loadProc = Bun.spawn(
+    ["launchctl", "bootstrap", `gui/${uid}`, getPlistPath()],
+    { stdout: "inherit", stderr: "inherit" }
+  );
+  await loadProc.exited;
 
-    // Generate and write plist
-    const plist = generatePlist(bunPath, cliPath, home);
-    await Bun.write(PLIST_PATH, plist);
-    console.log(`Plist written to ${PLIST_PATH}`);
-
-    // Load the daemon
-    const uid = process.getuid?.() ?? 501;
-    const loadProc = Bun.spawn(
-      ["launchctl", "bootstrap", `gui/${uid}`, PLIST_PATH],
+  if (loadProc.exitCode === 0) {
+    console.log("Daemon installed and loaded.");
+    console.log("It will start automatically on login.");
+  } else {
+    console.log("Bootstrap returned non-zero (may already be loaded). Trying kickstart...");
+    const kickProc = Bun.spawn(
+      ["launchctl", "kickstart", "-k", `gui/${uid}/${LABEL}`],
       { stdout: "inherit", stderr: "inherit" }
     );
-    await loadProc.exited;
-
-    if (loadProc.exitCode === 0) {
-      console.log("Daemon installed and loaded.");
-      console.log("It will start automatically on login.");
+    await kickProc.exited;
+    if (kickProc.exitCode === 0) {
+      console.log("Daemon restarted.");
     } else {
-      // Might already be loaded; try kickstart
-      console.log("Bootstrap returned non-zero (may already be loaded). Trying kickstart...");
-      const kickProc = Bun.spawn(
-        ["launchctl", "kickstart", "-k", `gui/${uid}/${LABEL}`],
-        { stdout: "inherit", stderr: "inherit" }
-      );
-      await kickProc.exited;
-      if (kickProc.exitCode === 0) {
-        console.log("Daemon restarted.");
-      } else {
-        console.error("Failed to start daemon. Check: launchctl print gui/" + uid + "/" + LABEL);
-      }
+      console.error("Failed to start daemon. Check: launchctl print gui/" + uid + "/" + LABEL);
+    }
+  }
+}
+
+async function uninstallLaunchd() {
+  const plistPath = getPlistPath();
+  if (!existsSync(plistPath)) {
+    console.log("Daemon is not installed.");
+    return;
+  }
+
+  const uid = process.getuid?.() ?? 501;
+  const proc = Bun.spawn(
+    ["launchctl", "bootout", `gui/${uid}/${LABEL}`],
+    { stdout: "inherit", stderr: "inherit" }
+  );
+  await proc.exited;
+
+  try {
+    await unlink(plistPath);
+    console.log("Daemon uninstalled and plist removed.");
+  } catch {
+    console.log("Daemon unloaded but could not remove plist file.");
+  }
+}
+
+// --- Linux systemd ---
+
+function getSystemdDir(): string {
+  return join(homedir(), ".config", "systemd", "user");
+}
+
+function getServicePath(): string {
+  return join(getSystemdDir(), SYSTEMD_SERVICE);
+}
+
+function generateSystemdUnit(bunPath: string, cliPath: string, home: string): string {
+  const logsDir = join(home, "logs");
+  const userHome = homedir();
+
+  // Build PATH for the service
+  const pathDirs = [
+    join(userHome, ".local", "bin"),
+    join(userHome, ".bun", "bin"),
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+  ];
+  const bunDir = bunPath.substring(0, bunPath.lastIndexOf("/"));
+  if (bunDir && !pathDirs.includes(bunDir)) pathDirs.unshift(bunDir);
+
+  return `[Unit]
+Description=Clawster AI Agent Orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${bunPath} ${cliPath} start --foreground
+WorkingDirectory=${home}
+Environment=PATH=${pathDirs.join(":")}
+Environment=HOME=${userHome}
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:${join(logsDir, "clawster.log")}
+StandardError=append:${join(logsDir, "clawster.error.log")}
+
+[Install]
+WantedBy=default.target
+`;
+}
+
+async function installSystemd() {
+  const home = getClawsterHome();
+
+  const whichProc = Bun.spawn(["which", "bun"], { stdout: "pipe" });
+  const bunPath = (await new Response(whichProc.stdout).text()).trim();
+  await whichProc.exited;
+  if (!bunPath) {
+    console.error("Could not find bun in PATH.");
+    process.exit(1);
+  }
+
+  const cliPath = join(import.meta.dir, "index.ts");
+
+  await mkdir(join(home, "logs"), { recursive: true });
+  await mkdir(getSystemdDir(), { recursive: true });
+
+  const unit = generateSystemdUnit(bunPath, cliPath, home);
+  await writeFile(getServicePath(), unit);
+  console.log(`Service unit written to ${getServicePath()}`);
+
+  // Reload systemd and enable/start the service
+  const reload = Bun.spawn(["systemctl", "--user", "daemon-reload"], {
+    stdout: "inherit", stderr: "inherit",
+  });
+  await reload.exited;
+
+  const enable = Bun.spawn(["systemctl", "--user", "enable", SYSTEMD_SERVICE], {
+    stdout: "inherit", stderr: "inherit",
+  });
+  await enable.exited;
+
+  const start = Bun.spawn(["systemctl", "--user", "start", SYSTEMD_SERVICE], {
+    stdout: "inherit", stderr: "inherit",
+  });
+  await start.exited;
+
+  if (start.exitCode === 0) {
+    console.log("Daemon installed, enabled, and started.");
+    console.log("It will start automatically on login.");
+    console.log(`Check status: systemctl --user status ${SYSTEMD_SERVICE}`);
+  } else {
+    console.error(`Failed to start. Check: systemctl --user status ${SYSTEMD_SERVICE}`);
+  }
+
+  // Enable lingering so the user service runs even without an active session
+  const linger = Bun.spawn(["loginctl", "enable-linger"], {
+    stdout: "inherit", stderr: "inherit",
+  });
+  await linger.exited;
+  if (linger.exitCode === 0) {
+    console.log("Lingering enabled — service will run even when logged out.");
+  }
+}
+
+async function uninstallSystemd() {
+  const servicePath = getServicePath();
+  if (!existsSync(servicePath)) {
+    console.log("Daemon is not installed.");
+    return;
+  }
+
+  const stop = Bun.spawn(["systemctl", "--user", "stop", SYSTEMD_SERVICE], {
+    stdout: "inherit", stderr: "inherit",
+  });
+  await stop.exited;
+
+  const disable = Bun.spawn(["systemctl", "--user", "disable", SYSTEMD_SERVICE], {
+    stdout: "inherit", stderr: "inherit",
+  });
+  await disable.exited;
+
+  try {
+    await unlink(servicePath);
+    console.log("Daemon stopped, disabled, and service file removed.");
+  } catch {
+    console.log("Daemon stopped but could not remove service file.");
+  }
+
+  // Reload after removing
+  Bun.spawn(["systemctl", "--user", "daemon-reload"], {
+    stdout: "inherit", stderr: "inherit",
+  });
+}
+
+// --- CLI commands ---
+
+export const daemonCommand = new Command("daemon").description(
+  "Manage the Clawster daemon (launchd on macOS, systemd on Linux)"
+);
+
+daemonCommand
+  .command("install")
+  .description("Install the daemon for the current platform")
+  .action(async () => {
+    if (isMac()) {
+      await installLaunchd();
+    } else if (isLinux()) {
+      await installSystemd();
+    } else {
+      console.error(`Unsupported platform: ${platform()}. Use 'clawster start --foreground' instead.`);
+      process.exit(1);
     }
   });
 
-// clawster daemon uninstall
 daemonCommand
   .command("uninstall")
-  .description("Uninstall the launchd daemon")
+  .description("Uninstall the daemon for the current platform")
   .action(async () => {
-    if (!existsSync(PLIST_PATH)) {
-      console.log("Daemon is not installed.");
-      return;
-    }
-
-    const uid = process.getuid?.() ?? 501;
-    const proc = Bun.spawn(
-      ["launchctl", "bootout", `gui/${uid}/${LABEL}`],
-      { stdout: "inherit", stderr: "inherit" }
-    );
-    await proc.exited;
-
-    try {
-      await unlink(PLIST_PATH);
-      console.log("Daemon uninstalled and plist removed.");
-    } catch {
-      console.log("Daemon unloaded but could not remove plist file.");
+    if (isMac()) {
+      await uninstallLaunchd();
+    } else if (isLinux()) {
+      await uninstallSystemd();
+    } else {
+      console.error(`Unsupported platform: ${platform()}.`);
+      process.exit(1);
     }
   });

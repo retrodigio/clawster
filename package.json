@@ -1,6 +1,6 @@
 {
   "name": "clawster",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Autonomous AI agent orchestrator — run Claude Code agents via Telegram",
   "type": "module",
   "bin": {
@@ -41,6 +41,7 @@
     "typescript": "^5.7.0"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.104",
     "commander": "^14.0.3",
     "grammy": "^1.42.0"
   }

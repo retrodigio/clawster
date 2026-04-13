@@ -1,5 +1,7 @@
+import { query, type Query, type Options } from "@anthropic-ai/claude-agent-sdk";
 import { log } from "./logger.ts";
 import type { AgentConfig } from "./types.ts";
+import { getSession, saveSession } from "./session-store.ts";
 
 type QueuedResolve = () => void;
 
@@ -29,9 +31,8 @@ function createSemaphore(max: number) {
   return { acquire, release };
 }
 
-// Track running processes per agent so we can interrupt them
-interface RunningProcess {
-  proc: ReturnType<typeof Bun.spawn>;
+interface RunningQuery {
+  query: Query;
   sessionId: string | null;
   agentKey: string;
 }
@@ -39,43 +40,123 @@ interface RunningProcess {
 export function createAgentRunner(options: {
   maxConcurrent: number;
   mcpConfigPath: string;
-  claudePath: string;
 }) {
-  const { maxConcurrent, mcpConfigPath, claudePath } = options;
+  const { maxConcurrent, mcpConfigPath } = options;
   const semaphore = createSemaphore(maxConcurrent);
   const agentMutex = new Map<string, Promise<void>>();
-  const activeProcesses = new Map<string, RunningProcess>();
+  const activeQueries = new Map<string, RunningQuery>();
+
+  // Load MCP config once at startup
+  let mcpServers: Record<string, any> | undefined;
+  if (mcpConfigPath) {
+    try {
+      const raw = JSON.parse(
+        require("fs").readFileSync(mcpConfigPath, "utf-8"),
+      );
+      if (raw.mcpServers) {
+        mcpServers = {};
+        for (const [name, config] of Object.entries(raw.mcpServers as Record<string, any>)) {
+          // Pass through — config should use SDK-compatible types (sse, http, stdio)
+          mcpServers[name] = config;
+        }
+        log.info("runner", "Loaded MCP config", { servers: Object.keys(mcpServers) });
+      }
+    } catch {
+      log.warn("runner", "Could not load MCP config", { path: mcpConfigPath });
+    }
+  }
 
   function getAgentKey(agentId: string, topicId?: number): string {
     return topicId ? `${agentId}-topic-${topicId}` : agentId;
   }
 
+  /** Build SDK options common to all runs for a given agent. */
+  function buildQueryOptions(agent: AgentConfig, resumeSessionId: string | null): Options {
+    const opts: Options = {
+      cwd: agent.workspace,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      settingSources: ["project", "user"],
+      includePartialMessages: true,
+      systemPrompt: {
+        type: "preset",
+        preset: "claude_code",
+        append: `You are ${agent.name}. Respond concisely — your output goes to Telegram.`,
+      },
+    };
+
+    if (resumeSessionId) {
+      opts.resume = resumeSessionId;
+      opts.forkSession = true;
+    }
+
+    if (mcpServers) {
+      opts.mcpServers = mcpServers;
+    }
+
+    return opts;
+  }
+
   /**
-   * Interrupt a running process for an agent/topic.
-   * Sends SIGINT, waits for exit, returns the session ID for resume.
+   * Interrupt a running query for an agent/topic.
+   * Uses SDK's interrupt() for graceful stop, returns session ID for resume.
    */
   async function interruptIfRunning(agentKey: string): Promise<string | null> {
-    const running = activeProcesses.get(agentKey);
+    const running = activeQueries.get(agentKey);
     if (!running) return null;
 
-    log.info(running.agentKey, "Interrupting running process for new message", {
+    log.info(running.agentKey, "Interrupting running query for new message", {
       sessionId: running.sessionId,
     });
 
     try {
-      running.proc.kill("SIGINT");
-      await running.proc.exited;
+      await running.query.interrupt();
     } catch {
-      // Process may have already exited
+      // Query may have already completed
+      try {
+        running.query.close();
+      } catch {
+        // Already closed
+      }
     }
 
-    activeProcesses.delete(agentKey);
+    activeQueries.delete(agentKey);
     return running.sessionId;
   }
 
   /**
+   * Extract text result from SDK messages (non-streaming).
+   * Collects all messages and returns the final result text.
+   */
+  async function collectResult(
+    q: Query,
+    agentKey: string,
+    onSessionId?: (id: string) => void,
+  ): Promise<{ text: string; sessionId: string | null }> {
+    let sessionId: string | null = null;
+    let resultText = "";
+
+    for await (const message of q) {
+      if (message.type === "system" && message.subtype === "init") {
+        sessionId = message.session_id;
+        onSessionId?.(sessionId);
+      }
+
+      if (message.type === "result") {
+        if ("result" in message) {
+          resultText = message.result ?? "";
+        }
+        if (message.session_id) {
+          sessionId = message.session_id;
+        }
+      }
+    }
+
+    return { text: resultText.trim(), sessionId };
+  }
+
+  /**
    * Non-streaming run — used by scheduler/heartbeats.
-   * Now properly extracts and saves session IDs via stream-json.
    */
   async function run(
     agent: AgentConfig,
@@ -98,83 +179,36 @@ export function createAgentRunner(options: {
       await semaphore.acquire();
 
       try {
-        const { getSession, saveSession } = await import("./session-store.ts");
         const session = await getSession(agent.id, runOptions?.topicId);
+        const resumeSessionId = session?.sessionId ?? null;
 
-        const args: string[] = [
-          claudePath, "-p", prompt,
-          "--output-format", "stream-json",
-          "--verbose",
-        ];
+        const opts = buildQueryOptions(agent, resumeSessionId);
 
-        if (mcpConfigPath) {
-          args.push("--mcp-config", mcpConfigPath);
-        }
-
-        if (session?.sessionId) {
-          args.push("--resume", session.sessionId, "--fork-session");
-        }
-
-        log.info(agent.id, "Spawning claude process", {
-          hasSession: !!session?.sessionId,
+        log.info(agent.id, "Starting SDK query", {
+          hasSession: !!resumeSessionId,
           timeout,
         });
 
-        const proc = Bun.spawn(args, {
-          cwd: agent.workspace,
-          stdout: "pipe",
-          stderr: "pipe",
-          env: { ...process.env },
-        });
+        const abortController = new AbortController();
+        opts.abortController = abortController;
+
+        const q = query({ prompt, options: opts });
 
         let timedOut = false;
         const timer = setTimeout(() => {
           timedOut = true;
-          log.warn(agent.id, "Process timed out, killing", { timeout });
-          proc.kill();
+          log.warn(agent.id, "Query timed out, aborting", { timeout });
+          abortController.abort();
         }, timeout);
 
         try {
-          // Parse stream-json to extract session ID and result
-          let sessionId: string | null = session?.sessionId ?? null;
-          let resultText = "";
+          const { text, sessionId } = await collectResult(q, agentKey);
 
-          const reader = proc.stdout.getReader();
-          const decoder = new TextDecoder();
-          let buffer = "";
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() ?? "";
-
-            for (const line of lines) {
-              if (!line.trim()) continue;
-              try {
-                const parsed = JSON.parse(line);
-                if (parsed.type === "system" && parsed.subtype === "init" && parsed.session_id) {
-                  sessionId = parsed.session_id;
-                }
-                if (parsed.type === "result") {
-                  resultText = parsed.result ?? "";
-                  if (parsed.session_id) sessionId = parsed.session_id;
-                }
-              } catch {
-                // Skip unparseable lines
-              }
-            }
-          }
-
-          const stderrText = await new Response(proc.stderr).text();
-          const exitCode = await proc.exited;
           clearTimeout(timer);
 
           if (timedOut) {
-            log.error(agent.id, "Claude process timed out", { timeout });
-            // Still save session ID if we got one — allows resume after timeout
-            if (sessionId && sessionId !== session?.sessionId) {
+            log.error(agent.id, "SDK query timed out", { timeout });
+            if (sessionId) {
               await saveSession(agent.id, {
                 sessionId,
                 lastActivity: new Date().toISOString(),
@@ -185,29 +219,7 @@ export function createAgentRunner(options: {
             return "Sorry, the request timed out. Please try again with a simpler question.";
           }
 
-          if (exitCode !== 0) {
-            log.error(agent.id, "Claude process failed", {
-              exitCode,
-              stderr: stderrText.slice(0, 500),
-            });
-
-            if (
-              stderrText.toLowerCase().includes("session") ||
-              stderrText.toLowerCase().includes("resume")
-            ) {
-              log.warn(agent.id, "Session error detected, clearing session");
-              await saveSession(agent.id, {
-                sessionId: null,
-                lastActivity: new Date().toISOString(),
-                lastHeartbeat: session?.lastHeartbeat ?? null,
-                messageCount: session?.messageCount ?? 0,
-              }, runOptions?.topicId);
-            }
-
-            return "Something went wrong processing your message. Please try again.";
-          }
-
-          // Save session ID for future resume
+          // Save session for future resume
           await saveSession(agent.id, {
             sessionId,
             lastActivity: new Date().toISOString(),
@@ -215,12 +227,12 @@ export function createAgentRunner(options: {
             messageCount: (session?.messageCount ?? 0) + 1,
           }, runOptions?.topicId);
 
-          log.info(agent.id, "Claude process completed", {
+          log.info(agent.id, "SDK query completed", {
             sessionId: sessionId?.slice(0, 12),
             messageCount: (session?.messageCount ?? 0) + 1,
           });
 
-          return resultText.trim();
+          return text;
         } catch (err) {
           clearTimeout(timer);
           throw err;
@@ -235,9 +247,7 @@ export function createAgentRunner(options: {
 
   /**
    * Streaming run — used by text message handler.
-   * Supports interruption: if a new message arrives while this is running,
-   * the bot can call interruptIfRunning() to SIGINT this process,
-   * then resume with the new message using the captured session ID.
+   * Supports interruption via SDK's interrupt() method.
    */
   async function runStreaming(
     agent: AgentConfig,
@@ -248,7 +258,7 @@ export function createAgentRunner(options: {
     const timeout = runOptions?.timeout ?? 600_000;
     const agentKey = getAgentKey(agent.id, runOptions?.topicId);
 
-    // Interrupt any running process for this agent/topic
+    // Interrupt any running query for this agent/topic
     const interruptedSessionId = await interruptIfRunning(agentKey);
 
     const prev = agentMutex.get(agentKey) ?? Promise.resolve();
@@ -264,54 +274,38 @@ export function createAgentRunner(options: {
       await semaphore.acquire();
 
       try {
-        const { getSession, saveSession } = await import("./session-store.ts");
         const session = await getSession(agent.id, runOptions?.topicId);
 
-        // Use interrupted session ID if we just killed a running process,
+        // Use interrupted session ID if we just stopped a running query,
         // otherwise use the persisted session ID
         const resumeSessionId = interruptedSessionId ?? session?.sessionId ?? null;
 
-        const args: string[] = [
-          claudePath, "-p", prompt,
-          "--output-format", "stream-json",
-          "--verbose",
-          "--include-partial-messages",
-        ];
+        const opts = buildQueryOptions(agent, resumeSessionId);
 
-        if (mcpConfigPath) {
-          args.push("--mcp-config", mcpConfigPath);
-        }
-
-        if (resumeSessionId) {
-          args.push("--resume", resumeSessionId, "--fork-session");
-        }
-
-        log.info(agent.id, "Spawning claude streaming process", {
+        log.info(agent.id, "Starting SDK streaming query", {
           hasSession: !!resumeSessionId,
           interrupted: !!interruptedSessionId,
           timeout,
         });
 
-        const proc = Bun.spawn(args, {
-          cwd: agent.workspace,
-          stdout: "pipe",
-          stderr: "pipe",
-          env: { ...process.env },
-        });
+        const abortController = new AbortController();
+        opts.abortController = abortController;
 
-        // Track this process so it can be interrupted
-        const runningProcess: RunningProcess = {
-          proc,
+        const q = query({ prompt, options: opts });
+
+        // Track this query so it can be interrupted
+        const runningQuery: RunningQuery = {
+          query: q,
           sessionId: resumeSessionId,
           agentKey,
         };
-        activeProcesses.set(agentKey, runningProcess);
+        activeQueries.set(agentKey, runningQuery);
 
         let timedOut = false;
         const timer = setTimeout(() => {
           timedOut = true;
-          log.warn(agent.id, "Streaming process timed out, killing", { timeout });
-          proc.kill();
+          log.warn(agent.id, "Streaming query timed out, aborting", { timeout });
+          abortController.abort();
         }, timeout);
 
         try {
@@ -320,69 +314,44 @@ export function createAgentRunner(options: {
           let resultText: string | null = null;
           let lastUpdateTime = 0;
 
-          const reader = proc.stdout.getReader();
-          const decoder = new TextDecoder();
-          let buffer = "";
+          for await (const message of q) {
+            if (message.type === "system" && message.subtype === "init") {
+              sessionId = message.session_id;
+              runningQuery.sessionId = sessionId;
+            }
 
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() ?? "";
-
-            for (const line of lines) {
-              if (!line.trim()) continue;
-              try {
-                const parsed = JSON.parse(line);
-
-                if (parsed.type === "system" && parsed.subtype === "init" && parsed.session_id) {
-                  sessionId = parsed.session_id;
-                  // Update the running process record with new session ID
-                  runningProcess.sessionId = sessionId;
+            // Stream text deltas for live Telegram updates
+            if (message.type === "stream_event") {
+              const evt = message.event as any;
+              if (evt?.type === "content_block_delta" && evt.delta?.type === "text_delta" && evt.delta.text) {
+                accumulated += evt.delta.text;
+                const now = Date.now();
+                if (now - lastUpdateTime >= 2000) {
+                  lastUpdateTime = now;
+                  onUpdate(accumulated);
                 }
+              }
+            }
 
-                if (parsed.type === "stream_event") {
-                  const evt = parsed.event;
-                  if (evt?.delta?.type === "text_delta" && evt.delta.text) {
-                    accumulated += evt.delta.text;
-                    const now = Date.now();
-                    if (now - lastUpdateTime >= 2000) {
-                      lastUpdateTime = now;
-                      onUpdate(accumulated);
-                    }
-                  }
-                }
-
-                if (parsed.type === "result") {
-                  resultText = parsed.result ?? accumulated;
-                  if (parsed.session_id) {
-                    sessionId = parsed.session_id;
-                  }
-                }
-              } catch {
-                // Skip unparseable lines
+            if (message.type === "result") {
+              if ("result" in message) {
+                resultText = message.result ?? accumulated;
+              }
+              if (message.session_id) {
+                sessionId = message.session_id;
               }
             }
           }
 
-          // Remove from active processes
-          activeProcesses.delete(agentKey);
+          // Remove from active queries
+          activeQueries.delete(agentKey);
 
-          // Final update with complete text
           const finalText = resultText ?? accumulated;
-          if (finalText) {
-            onUpdate(finalText);
-          }
-
-          const stderrText = await new Response(proc.stderr).text();
-          const exitCode = await proc.exited;
 
           clearTimeout(timer);
 
           if (timedOut) {
-            log.error(agent.id, "Claude streaming process timed out", { timeout });
-            // Still save session for resume
+            log.error(agent.id, "SDK streaming query timed out", { timeout });
             if (sessionId) {
               await saveSession(agent.id, {
                 sessionId,
@@ -397,32 +366,7 @@ export function createAgentRunner(options: {
             };
           }
 
-          if (exitCode !== 0) {
-            log.error(agent.id, "Claude streaming process failed", {
-              exitCode,
-              stderr: stderrText.slice(0, 500),
-            });
-
-            if (
-              stderrText.toLowerCase().includes("session") ||
-              stderrText.toLowerCase().includes("resume")
-            ) {
-              log.warn(agent.id, "Session error detected, clearing session");
-              await saveSession(agent.id, {
-                sessionId: null,
-                lastActivity: new Date().toISOString(),
-                lastHeartbeat: session?.lastHeartbeat ?? null,
-                messageCount: session?.messageCount ?? 0,
-              }, runOptions?.topicId);
-            }
-
-            return {
-              text: "Something went wrong processing your message. Please try again.",
-              sessionId,
-            };
-          }
-
-          // Save session ID for future resume
+          // Save session for future resume
           await saveSession(agent.id, {
             sessionId,
             lastActivity: new Date().toISOString(),
@@ -430,7 +374,7 @@ export function createAgentRunner(options: {
             messageCount: (session?.messageCount ?? 0) + 1,
           }, runOptions?.topicId);
 
-          log.info(agent.id, "Claude streaming process completed", {
+          log.info(agent.id, "SDK streaming query completed", {
             sessionId: sessionId?.slice(0, 12),
             messageCount: (session?.messageCount ?? 0) + 1,
           });
@@ -438,7 +382,7 @@ export function createAgentRunner(options: {
           return { text: finalText.trim(), sessionId };
         } catch (err) {
           clearTimeout(timer);
-          activeProcesses.delete(agentKey);
+          activeQueries.delete(agentKey);
           throw err;
         }
       } finally {
