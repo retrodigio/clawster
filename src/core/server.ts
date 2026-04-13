@@ -1,5 +1,5 @@
 import { join } from "path";
-import { loadConfig, getClawsterHome } from "./config.ts";
+import { loadConfig } from "./config.ts";
 import { initRouter, resolveAgent } from "./router.ts";
 import { createAgentRunner } from "./agent-runner.ts";
 import { createBot } from "./bot.ts";
@@ -18,19 +18,17 @@ export async function startServer() {
   const { config, agents, chatIdToAgent, agentById, defaultAgent } = await loadConfig();
 
   const unboundChatIds = new Set<string>(agents.unboundChatIds);
-  initRouter(chatIdToAgent, defaultAgent, unboundChatIds);
+  initRouter(chatIdToAgent, defaultAgent, unboundChatIds, agents);
 
   const resolveAgentFn = (chatId: string, isPrivate: boolean) =>
     resolveAgent(chatId, isPrivate);
 
-  // TODO Phase 2: Add stdio-based MCP wrapper for Open Brain
-  // For now, agents use `ob` CLI directly for memory operations
-  const mcpConfigPath = "";
+  // MCP config for Open Brain shared memory
+  const mcpConfigPath = join(import.meta.dir, "..", "..", "config", "mcp-open-brain.json");
 
   const runner = createAgentRunner({
     maxConcurrent: config.maxConcurrent,
     mcpConfigPath,
-    claudePath: config.claudePath,
   });
 
   const bot = createBot({

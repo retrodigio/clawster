@@ -1,12 +1,13 @@
 import { Command } from "commander";
 import { readFile, unlink } from "fs/promises";
 import { existsSync } from "fs";
-import { homedir } from "os";
+import { homedir, platform } from "os";
 import { join } from "path";
 import { getClawsterHome } from "../core/config.ts";
 
 const PLIST_PATH = join(homedir(), "Library", "LaunchAgents", "com.clawster.daemon.plist");
 const LABEL = "com.clawster.daemon";
+const SYSTEMD_SERVICE = "clawster.service";
 
 export const stopCommand = new Command("stop")
   .description("Stop the Clawster orchestrator")
@@ -35,8 +36,8 @@ export const stopCommand = new Command("stop")
       }
     }
 
-    // Also try launchctl bootout if daemon is installed
-    if (existsSync(PLIST_PATH)) {
+    // Platform-specific daemon stop
+    if (platform() === "darwin" && existsSync(PLIST_PATH)) {
       const uid = process.getuid?.() ?? 501;
       const proc = Bun.spawn(["launchctl", "bootout", `gui/${uid}/${LABEL}`], {
         stdout: "inherit",
@@ -45,6 +46,16 @@ export const stopCommand = new Command("stop")
       await proc.exited;
       if (proc.exitCode === 0) {
         console.log("Daemon unloaded via launchctl.");
+        stopped = true;
+      }
+    } else if (platform() === "linux") {
+      const proc = Bun.spawn(["systemctl", "--user", "stop", SYSTEMD_SERVICE], {
+        stdout: "inherit",
+        stderr: "inherit",
+      });
+      await proc.exited;
+      if (proc.exitCode === 0) {
+        console.log("Daemon stopped via systemctl.");
         stopped = true;
       }
     }
