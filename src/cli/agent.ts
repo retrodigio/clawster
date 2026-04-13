@@ -220,11 +220,18 @@ agentCommand
       const chatId = ctx.chat.id.toString();
       const title = "title" in ctx.chat ? ctx.chat.title : "DM";
       const chatType = ctx.chat.type;
+      const topicId = ctx.message.message_thread_id;
 
-      if (!discovered.has(chatId)) {
-        discovered.set(chatId, title ?? "unknown");
-        console.log(`\n  "${chatId}": "${title}" (${chatType})`);
-        console.log(`  --- ${discovered.size} chat(s) discovered so far ---`);
+      const key = topicId ? `${chatId}:${topicId}` : chatId;
+
+      if (!discovered.has(key)) {
+        discovered.set(key, title ?? "unknown");
+        if (topicId) {
+          console.log(`\n  chat "${chatId}" topic ${topicId} — "${title}" (${chatType})`);
+        } else {
+          console.log(`\n  chat "${chatId}" — "${title}" (${chatType})`);
+        }
+        console.log(`  --- ${discovered.size} entry/entries discovered so far ---`);
       }
     });
 
@@ -236,10 +243,15 @@ agentCommand
 
     process.on("SIGINT", () => {
       console.log("\n\n=== Final mapping ===\n");
-      for (const [id, title] of discovered) {
-        console.log(`  "${id}": "${title}"`);
+      for (const [key, title] of discovered) {
+        if (key.includes(":")) {
+          const [chatId, topicId] = key.split(":");
+          console.log(`  chat "${chatId}" topic ${topicId} — "${title}"`);
+        } else {
+          console.log(`  chat "${key}" — "${title}"`);
+        }
       }
-      console.log(`\nTotal: ${discovered.size} chat(s)`);
+      console.log(`\nTotal: ${discovered.size} entry/entries`);
       process.exit(0);
     });
   });

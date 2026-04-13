@@ -1,21 +1,30 @@
+import { log } from "./logger.ts";
+
 export function startHealthServer(agentCount: number, port: number): void {
-  Bun.serve({
-    port,
-    fetch(req) {
-      const url = new URL(req.url);
+  try {
+    Bun.serve({
+      port,
+      fetch(req) {
+        const url = new URL(req.url);
 
-      if (url.pathname === "/health") {
-        return Response.json({
-          status: "ok",
-          uptime: process.uptime(),
-          agents: agentCount,
-          pid: process.pid,
-        });
-      }
+        if (url.pathname === "/health") {
+          return Response.json({
+            status: "ok",
+            uptime: process.uptime(),
+            agents: agentCount,
+            pid: process.pid,
+          });
+        }
 
-      return new Response("Not Found", { status: 404 });
-    },
-  });
+        return new Response("Not Found", { status: 404 });
+      },
+    });
 
-  console.log(`Health server listening on http://localhost:${port}/health`);
+    log.info("system", `Health server listening on port ${port}`);
+  } catch (err) {
+    // Don't crash the whole orchestrator if the health port is busy
+    log.warn("system", `Health server failed to start on port ${port}`, {
+      error: String(err),
+    });
+  }
 }
