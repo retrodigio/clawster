@@ -14,7 +14,10 @@ interface CreateBotOptions {
   allowedUserId: string;
   groqKey?: string;
   resolveAgent: (chatId: string, isPrivate: boolean) => AgentConfig | null;
-  runner: { run(agent: AgentConfig, prompt: string, opts?: { topicId?: number }): Promise<string> };
+  runner: {
+    run(agent: AgentConfig, prompt: string, opts?: { topicId?: number }): Promise<string>;
+    runStreaming(agent: AgentConfig, prompt: string, onUpdate: (textSoFar: string) => void, opts?: { topicId?: number; timeout?: number }): Promise<{ text: string; sessionId: string | null }>;
+  };
   agentById: Map<string, AgentConfig>;
 }
 
@@ -74,29 +77,38 @@ export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runn
     const prompt = buildPrompt(agent, ctx.message.text, messageContext);
 
     let typingInterval: ReturnType<typeof setInterval> | undefined;
-    let placeholderMsgId: number | undefined;
-    let placeholderTimeout: ReturnType<typeof setTimeout> | undefined;
+    let streamMsgId: number | undefined;
+    let streamStoppedEditing = false;
     try {
       await ctx.replyWithChatAction("typing");
       typingInterval = setInterval(() => {
         ctx.replyWithChatAction("typing").catch(() => {});
       }, 5000);
 
-      // After 15 seconds, send a placeholder so the user knows we're still working
       const replyOpts = topicId ? { message_thread_id: topicId } : undefined;
-      placeholderTimeout = setTimeout(async () => {
-        try {
-          const msg = await ctx.reply("Thinking...", replyOpts);
-          placeholderMsgId = msg.message_id;
-        } catch {
-          // Non-critical — just skip the placeholder
+
+      const onUpdate = async (textSoFar: string) => {
+        if (!textSoFar || textSoFar.length < 200 || streamStoppedEditing) return;
+
+        // If text is too long for a single message, stop editing — we'll send chunked at the end
+        if (textSoFar.length > 4000) {
+          streamStoppedEditing = true;
+          return;
         }
-      }, 15_000);
 
-      const response = await runner.run(agent, prompt, { topicId });
+        try {
+          if (!streamMsgId) {
+            const msg = await ctx.reply(textSoFar, replyOpts);
+            streamMsgId = msg.message_id;
+          } else {
+            await ctx.api.editMessageText(ctx.chat.id, streamMsgId, textSoFar);
+          }
+        } catch {
+          // Telegram edit failed — skip this update, try next time
+        }
+      };
 
-      clearTimeout(placeholderTimeout);
-      placeholderTimeout = undefined;
+      const { text: response } = await runner.runStreaming(agent, prompt, onUpdate, { topicId });
 
       const { clean, intents } = parseIntents(response);
 
@@ -107,18 +119,18 @@ export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runn
         });
       }
 
-      // If we sent a placeholder and the response fits in one message, edit it in-place
-      if (placeholderMsgId && clean.length <= 4000) {
+      // Final delivery: update streaming message or send full response
+      if (streamMsgId && clean.length <= 4000) {
+        // Edit to final clean text (intents stripped, etc.)
         try {
-          await ctx.api.editMessageText(ctx.chat.id, placeholderMsgId, clean);
+          await ctx.api.editMessageText(ctx.chat.id, streamMsgId, clean);
         } catch {
-          // Edit failed — fall back to sending normally
           await sendResponse(ctx, clean, topicId);
         }
       } else {
-        // Delete placeholder if it was sent, then send the full response
-        if (placeholderMsgId) {
-          await ctx.api.deleteMessage(ctx.chat.id, placeholderMsgId).catch(() => {});
+        // Delete partial message if it exists, send full response with chunking
+        if (streamMsgId) {
+          await ctx.api.deleteMessage(ctx.chat.id, streamMsgId).catch(() => {});
         }
         await sendResponse(ctx, clean, topicId);
       }
@@ -127,7 +139,6 @@ export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runn
       await ctx.reply("Sorry, something went wrong processing your message.").catch(() => {});
     } finally {
       if (typingInterval) clearInterval(typingInterval);
-      if (placeholderTimeout) clearTimeout(placeholderTimeout);
     }
   });
 
