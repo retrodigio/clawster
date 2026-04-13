@@ -82,7 +82,7 @@ export function createAgentRunner(options: {
     prompt: string,
     runOptions?: { topicId?: number; timeout?: number },
   ): Promise<string> {
-    const timeout = runOptions?.timeout ?? 300_000;
+    const timeout = runOptions?.timeout ?? 600_000;
     const agentKey = getAgentKey(agent.id, runOptions?.topicId);
 
     const prev = agentMutex.get(agentKey) ?? Promise.resolve();
@@ -245,7 +245,7 @@ export function createAgentRunner(options: {
     onUpdate: (textSoFar: string) => void,
     runOptions?: { topicId?: number; timeout?: number },
   ): Promise<{ text: string; sessionId: string | null }> {
-    const timeout = runOptions?.timeout ?? 300_000;
+    const timeout = runOptions?.timeout ?? 600_000;
     const agentKey = getAgentKey(agent.id, runOptions?.topicId);
 
     // Interrupt any running process for this agent/topic
