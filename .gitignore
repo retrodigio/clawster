@@ -1,0 +1,31 @@
+# dependencies
+node_modules
+
+# output
+dist
+out
+*.tgz
+
+# env files (secrets)
+.env
+.env.*
+!.env.example
+
+# config (user-specific, lives in ~/.clawster/)
+config/agents.json
+
+# logs
+logs
+*.log
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# OS
+.DS_Store
+
+# IDE
+.idea
+.vscode

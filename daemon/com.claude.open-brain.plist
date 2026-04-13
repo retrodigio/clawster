@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.claude.open-brain</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/opt/node@22/bin/node</string>
+		<string>/Users/chriscrabtree/projects/open-brain/dist/mcp/server.js</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>/Users/chriscrabtree/projects/open-brain</string>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<true/>
+
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/local/opt/node@22/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>HOME</key>
+		<string>/Users/chriscrabtree</string>
+	</dict>
+
+	<key>StandardOutPath</key>
+	<string>/Users/chriscrabtree/Library/Logs/open-brain.log</string>
+
+	<key>StandardErrorPath</key>
+	<string>/Users/chriscrabtree/Library/Logs/open-brain.error.log</string>
+</dict>
+</plist>
