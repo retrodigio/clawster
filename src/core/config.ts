@@ -15,6 +15,7 @@ export interface ClawsterConfig {
   claudePath: string;
   healthPort: number;
   maxConcurrent: number;
+  groqKey?: string;
 }
 
 export interface AgentsConfig {
@@ -50,6 +51,7 @@ export async function loadConfig(): Promise<LoadedConfig> {
     claudePath: rawConfig.claudePath || "claude",
     healthPort: rawConfig.healthPort || 18800,
     maxConcurrent: rawConfig.maxConcurrent || 4,
+    groqKey: process.env.CLAWSTER_GROQ_KEY || rawConfig.groqKey || "",
   };
 
   if (!config.botToken) throw new Error("No bot token. Set in config.json or CLAWSTER_BOT_TOKEN env var.");

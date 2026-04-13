@@ -4,6 +4,7 @@ import { buildPrompt } from "./prompt-builder.ts";
 import { sendResponse } from "./message-sender.ts";
 import { parseIntents, processIntents } from "./intent-parser.ts";
 import { log } from "./logger.ts";
+import { transcribe } from "./transcribe.ts";
 import { writeFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -11,12 +12,13 @@ import { tmpdir } from "node:os";
 interface CreateBotOptions {
   botToken: string;
   allowedUserId: string;
+  groqKey?: string;
   resolveAgent: (chatId: string, isPrivate: boolean) => AgentConfig | null;
   runner: { run(agent: AgentConfig, prompt: string, opts?: { topicId?: number }): Promise<string> };
   agentById: Map<string, AgentConfig>;
 }
 
-export function createBot({ botToken, allowedUserId, resolveAgent, runner, agentById }: CreateBotOptions) {
+export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runner, agentById }: CreateBotOptions) {
   const bot = new Bot(botToken);
 
   // Auth middleware — only allowed user can interact
@@ -72,13 +74,29 @@ export function createBot({ botToken, allowedUserId, resolveAgent, runner, agent
     const prompt = buildPrompt(agent, ctx.message.text, messageContext);
 
     let typingInterval: ReturnType<typeof setInterval> | undefined;
+    let placeholderMsgId: number | undefined;
+    let placeholderTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
       await ctx.replyWithChatAction("typing");
       typingInterval = setInterval(() => {
         ctx.replyWithChatAction("typing").catch(() => {});
       }, 5000);
 
+      // After 15 seconds, send a placeholder so the user knows we're still working
+      const replyOpts = topicId ? { message_thread_id: topicId } : undefined;
+      placeholderTimeout = setTimeout(async () => {
+        try {
+          const msg = await ctx.reply("Thinking...", replyOpts);
+          placeholderMsgId = msg.message_id;
+        } catch {
+          // Non-critical — just skip the placeholder
+        }
+      }, 15_000);
+
       const response = await runner.run(agent, prompt, { topicId });
+
+      clearTimeout(placeholderTimeout);
+      placeholderTimeout = undefined;
 
       const { clean, intents } = parseIntents(response);
 
@@ -89,12 +107,27 @@ export function createBot({ botToken, allowedUserId, resolveAgent, runner, agent
         });
       }
 
-      await sendResponse(ctx, clean, topicId);
+      // If we sent a placeholder and the response fits in one message, edit it in-place
+      if (placeholderMsgId && clean.length <= 4000) {
+        try {
+          await ctx.api.editMessageText(ctx.chat.id, placeholderMsgId, clean);
+        } catch {
+          // Edit failed — fall back to sending normally
+          await sendResponse(ctx, clean, topicId);
+        }
+      } else {
+        // Delete placeholder if it was sent, then send the full response
+        if (placeholderMsgId) {
+          await ctx.api.deleteMessage(ctx.chat.id, placeholderMsgId).catch(() => {});
+        }
+        await sendResponse(ctx, clean, topicId);
+      }
     } catch (err) {
       log.error(agent.id, "Error handling message", { error: String(err) });
       await ctx.reply("Sorry, something went wrong processing your message.").catch(() => {});
     } finally {
       if (typingInterval) clearInterval(typingInterval);
+      if (placeholderTimeout) clearTimeout(placeholderTimeout);
     }
   });
 
@@ -122,6 +155,8 @@ export function createBot({ botToken, allowedUserId, resolveAgent, runner, agent
 
     let typingInterval: ReturnType<typeof setInterval> | undefined;
     let tempPath: string | undefined;
+    let placeholderMsgId: number | undefined;
+    let placeholderTimeout: ReturnType<typeof setTimeout> | undefined;
 
     try {
       // Download highest-res photo (last in array)
@@ -144,7 +179,21 @@ export function createBot({ botToken, allowedUserId, resolveAgent, runner, agent
         ctx.replyWithChatAction("typing").catch(() => {});
       }, 5000);
 
+      // After 15 seconds, send a placeholder so the user knows we're still working
+      const replyOpts = topicId ? { message_thread_id: topicId } : undefined;
+      placeholderTimeout = setTimeout(async () => {
+        try {
+          const msg = await ctx.reply("Thinking...", replyOpts);
+          placeholderMsgId = msg.message_id;
+        } catch {
+          // Non-critical
+        }
+      }, 15_000);
+
       const result = await runner.run(agent, prompt, { topicId });
+
+      clearTimeout(placeholderTimeout);
+      placeholderTimeout = undefined;
 
       const { clean, intents } = parseIntents(result);
 
@@ -154,15 +203,123 @@ export function createBot({ botToken, allowedUserId, resolveAgent, runner, agent
         });
       }
 
-      await sendResponse(ctx, clean, topicId);
+      if (placeholderMsgId && clean.length <= 4000) {
+        try {
+          await ctx.api.editMessageText(ctx.chat.id, placeholderMsgId, clean);
+        } catch {
+          await sendResponse(ctx, clean, topicId);
+        }
+      } else {
+        if (placeholderMsgId) {
+          await ctx.api.deleteMessage(ctx.chat.id, placeholderMsgId).catch(() => {});
+        }
+        await sendResponse(ctx, clean, topicId);
+      }
     } catch (err) {
       log.error(agent.id, "Error handling photo", { error: String(err) });
       await ctx.reply("Sorry, something went wrong processing your photo.").catch(() => {});
     } finally {
       if (typingInterval) clearInterval(typingInterval);
+      if (placeholderTimeout) clearTimeout(placeholderTimeout);
       if (tempPath) {
         unlink(tempPath).catch(() => {});
       }
+    }
+  });
+
+  // Voice message handler
+  bot.on("message:voice", async (ctx) => {
+    const chatId = ctx.chat.id.toString();
+    const isPrivate = ctx.chat.type === "private";
+    const agent = resolveAgent(chatId, isPrivate);
+
+    if (!agent) {
+      log.debug("orchestrator", "No agent found for chat", { chatId });
+      return;
+    }
+
+    const topicId = ctx.message.message_thread_id;
+    const topicName = resolveTopicName(agent, topicId, ctx);
+
+    const messageContext: MessageContext = {
+      agentId: agent.id,
+      chatId,
+      topicId,
+      topicName,
+      isPrivate,
+    };
+
+    let typingInterval: ReturnType<typeof setInterval> | undefined;
+    let placeholderMsgId: number | undefined;
+    let placeholderTimeout: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      // Download voice file from Telegram
+      const file = await ctx.getFile();
+      const fileUrl = `https://api.telegram.org/file/bot${botToken}/${file.file_path}`;
+      const response = await fetch(fileUrl);
+      const buffer = Buffer.from(await response.arrayBuffer());
+
+      // Transcribe
+      const transcription = await transcribe(buffer, groqKey ?? "");
+
+      if (!transcription) {
+        await ctx.reply("Couldn't transcribe voice message.");
+        return;
+      }
+
+      log.info("orchestrator", "Voice transcribed", { chatId, agentId: agent.id, length: transcription.length });
+
+      const promptText = `[Voice message]: ${transcription}`;
+      const prompt = buildPrompt(agent, promptText, messageContext);
+
+      await ctx.replyWithChatAction("typing");
+      typingInterval = setInterval(() => {
+        ctx.replyWithChatAction("typing").catch(() => {});
+      }, 5000);
+
+      // After 15 seconds, send a placeholder so the user knows we're still working
+      const replyOpts = topicId ? { message_thread_id: topicId } : undefined;
+      placeholderTimeout = setTimeout(async () => {
+        try {
+          const msg = await ctx.reply("Thinking...", replyOpts);
+          placeholderMsgId = msg.message_id;
+        } catch {
+          // Non-critical
+        }
+      }, 15_000);
+
+      const result = await runner.run(agent, prompt, { topicId });
+
+      clearTimeout(placeholderTimeout);
+      placeholderTimeout = undefined;
+
+      const { clean, intents } = parseIntents(result);
+
+      if (intents.length > 0) {
+        processIntents(intents).catch((err) => {
+          log.error(agent.id, "Failed to process intents", { error: String(err) });
+        });
+      }
+
+      if (placeholderMsgId && clean.length <= 4000) {
+        try {
+          await ctx.api.editMessageText(ctx.chat.id, placeholderMsgId, clean);
+        } catch {
+          await sendResponse(ctx, clean, topicId);
+        }
+      } else {
+        if (placeholderMsgId) {
+          await ctx.api.deleteMessage(ctx.chat.id, placeholderMsgId).catch(() => {});
+        }
+        await sendResponse(ctx, clean, topicId);
+      }
+    } catch (err) {
+      log.error(agent.id, "Error handling voice message", { error: String(err) });
+      await ctx.reply("Sorry, something went wrong processing your voice message.").catch(() => {});
+    } finally {
+      if (typingInterval) clearInterval(typingInterval);
+      if (placeholderTimeout) clearTimeout(placeholderTimeout);
     }
   });
 

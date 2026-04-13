@@ -54,6 +54,10 @@ export const initCommand = new Command("init")
     const detectedTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
     const timezone = await ask("Timezone", detectedTz);
 
+    // Groq API key (optional, for voice transcription)
+    console.log("\nGroq API key for voice transcription (optional, press Enter to skip):");
+    const groqKey = await ask("Groq API key");
+
     // Create directories
     await mkdir(home, { recursive: true });
     await mkdir(join(home, "sessions"), { recursive: true });
@@ -67,6 +71,7 @@ export const initCommand = new Command("init")
       claudePath: "claude",
       healthPort: 18800,
       maxConcurrent: 4,
+      ...(groqKey ? { groqKey } : {}),
     };
     await saveConfig(config);
 

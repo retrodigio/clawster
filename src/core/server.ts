@@ -36,6 +36,7 @@ export async function startServer() {
   const bot = createBot({
     botToken: config.botToken,
     allowedUserId: config.allowedUserId,
+    groqKey: config.groqKey,
     resolveAgent: resolveAgentFn,
     runner,
     agentById,
