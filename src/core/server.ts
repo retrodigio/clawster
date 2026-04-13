@@ -6,7 +6,7 @@ import { createBot } from "./bot.ts";
 import { acquireLock, releaseLock } from "./lock.ts";
 import { log } from "./logger.ts";
 import { startHealthServer } from "./health.ts";
-import { startHeartbeats } from "./heartbeat.ts";
+import { startScheduler } from "./scheduler.ts";
 
 export async function startServer() {
   const lockAcquired = await acquireLock();
@@ -53,7 +53,7 @@ export async function startServer() {
     onStart: () => {
       log.info("orchestrator", "Bot is running!");
       startHealthServer(agentById.size, config.healthPort);
-      startHeartbeats(agents.agents, runner, config.botToken, config.timezone);
+      startScheduler(agents.agents, runner, config.botToken, config.timezone);
     },
   });
 

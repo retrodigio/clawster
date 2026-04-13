@@ -113,7 +113,7 @@ agentCommand
       name: 20,
       workspace: 40,
       chat: 18,
-      heartbeat: 10,
+      tasks: 50,
     };
 
     console.log(
@@ -122,20 +122,28 @@ agentCommand
         "Name".padEnd(cols.name),
         "Workspace".padEnd(cols.workspace),
         "Chat ID".padEnd(cols.chat),
-        "Heartbeat".padEnd(cols.heartbeat),
+        "Tasks".padEnd(cols.tasks),
       ].join("  ")
     );
-    console.log("-".repeat(cols.id + cols.name + cols.workspace + cols.chat + cols.heartbeat + 8));
+    console.log("-".repeat(cols.id + cols.name + cols.workspace + cols.chat + cols.tasks + 8));
 
     for (const a of agentsData.agents) {
       const defaultMarker = a.isDefault ? " *" : "";
+
+      let tasksDisplay = "-";
+      if (a.tasks && a.tasks.length > 0) {
+        tasksDisplay = a.tasks.map((t) => `${t.name} (${t.schedule})`).join(", ");
+      } else if (a.heartbeat?.every) {
+        tasksDisplay = `heartbeat (${a.heartbeat.every})`;
+      }
+
       console.log(
         [
           (a.id + defaultMarker).padEnd(cols.id),
           a.name.padEnd(cols.name),
           a.workspace.slice(0, cols.workspace).padEnd(cols.workspace),
           (a.telegramChatId || "-").padEnd(cols.chat),
-          (a.heartbeat?.every || "-").padEnd(cols.heartbeat),
+          tasksDisplay,
         ].join("  ")
       );
     }
