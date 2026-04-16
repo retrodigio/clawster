@@ -86,6 +86,7 @@ export function createAgentRunner(options: {
 
   function buildQueryOptions(agent: AgentConfig, resumeSessionId: string | null): Options {
     const opts: Options = {
+      model: "claude-opus-4-7",
       cwd: agent.workspace,
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
@@ -246,6 +247,9 @@ export function createAgentRunner(options: {
     prompt: string,
     runOptions?: { topicId?: number; timeout?: number },
   ): Promise<string> {
+    if (isShuttingDown) {
+      throw new Error("Runner is shutting down — not accepting new queries");
+    }
     const inactivityTimeout = (agent.inactivityTimeout ?? 180) * 1000; // Default 3 min inactivity
     const maxTimeout = runOptions?.timeout ?? 1_800_000; // 30 min max
     const agentKey = getAgentKey(agent.id, runOptions?.topicId);
@@ -358,6 +362,9 @@ export function createAgentRunner(options: {
       onEvent?: (event: ConversationEvent) => void;
     },
   ): Promise<{ text: string; sessionId: string | null }> {
+    if (isShuttingDown) {
+      throw new Error("Runner is shutting down — not accepting new queries");
+    }
     const inactivityTimeout = (agent.inactivityTimeout ?? 180) * 1000; // Default 3 min inactivity
     const maxTimeout = runOptions?.timeout ?? 1_800_000; // 30 min max
     const agentKey = getAgentKey(agent.id, runOptions?.topicId);
@@ -558,5 +565,63 @@ export function createAgentRunner(options: {
     }
   }
 
-  return { run, runStreaming };
+  // --- Graceful shutdown support ---
+  let isShuttingDown = false;
+
+  /** Signal that no new queries should be accepted. */
+  function shutdown(): void {
+    isShuttingDown = true;
+    log.info("runner", "Shutdown signaled — rejecting new queries");
+  }
+
+  /**
+   * Wait for all in-flight queries to complete, or reject after timeoutMs.
+   * Resolves when activeQueries is empty.
+   */
+  function drain(timeoutMs: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      // Check immediately
+      if (activeQueries.size === 0) {
+        log.info("runner", "No active queries — drain complete");
+        resolve();
+        return;
+      }
+
+      log.info("runner", "Draining active queries", { count: activeQueries.size });
+
+      const timer = setTimeout(() => {
+        clearInterval(poller);
+        const remaining = activeQueries.size;
+        if (remaining > 0) {
+          log.warn("runner", `Drain timeout — ${remaining} queries still active, aborting them`);
+          // Abort remaining queries
+          for (const [key, rq] of activeQueries) {
+            try {
+              rq.query.close();
+            } catch {
+              // Already closed
+            }
+            activeQueries.delete(key);
+          }
+        }
+        resolve(); // Resolve even on timeout — we did our best
+      }, timeoutMs);
+
+      const poller = setInterval(() => {
+        if (activeQueries.size === 0) {
+          clearTimeout(timer);
+          clearInterval(poller);
+          log.info("runner", "All active queries drained");
+          resolve();
+        }
+      }, 500);
+    });
+  }
+
+  /** Check if the runner is accepting new queries. */
+  function isAccepting(): boolean {
+    return !isShuttingDown;
+  }
+
+  return { run, runStreaming, shutdown, drain, isAccepting };
 }

@@ -1,5 +1,5 @@
 import { join } from "path";
-import { loadConfig } from "./config.ts";
+import { loadConfig, loadApiToken } from "./config.ts";
 import { initRouter, resolveAgent } from "./router.ts";
 import { createAgentRunner } from "./agent-runner.ts";
 import { createBot } from "./bot.ts";
@@ -16,6 +16,7 @@ export async function startServer() {
   }
 
   const { config, agents, chatIdToAgent, agentById, defaultAgent } = await loadConfig();
+  const apiToken = await loadApiToken();
 
   const unboundChatIds = new Set<string>(agents.unboundChatIds);
   initRouter(chatIdToAgent, defaultAgent, unboundChatIds, agents);
@@ -53,7 +54,7 @@ export async function startServer() {
   bot.start({
     onStart: () => {
       log.info("orchestrator", "Bot is running!");
-      startWebApi({
+      webServer = startWebApi({
         port: config.healthPort,
         runner,
         getConfig: () => loaded,
@@ -61,15 +62,44 @@ export async function startServer() {
           loaded = await loadConfig();
           return loaded;
         },
+        apiToken,
       });
       startScheduler(agents.agents, runner, config.botToken, config.timezone);
     },
   });
 
+  let webServer: { stop(): void } | undefined;
+
   const shutdown = async () => {
-    log.info("orchestrator", "Shutting down...");
+    log.info("orchestrator", "Shutting down gracefully...");
+
+    // 1. Stop accepting new Telegram messages
     bot.stop();
+
+    // 2. Signal the runner to reject new queries
+    runner.shutdown();
+
+    // 3. Wait for in-flight queries to complete (max 30s)
+    const drainTimeout = 30_000;
+    try {
+      await runner.drain(drainTimeout);
+    } catch (err) {
+      log.warn("orchestrator", "Drain did not complete cleanly", { error: String(err) });
+    }
+
+    // 4. Close web server if running
+    if (webServer) {
+      try {
+        webServer.stop();
+      } catch {
+        // Already stopped
+      }
+    }
+
+    // 5. Release lock
     await releaseLock();
+
+    log.info("orchestrator", "Shutdown complete");
     process.exit(0);
   };
 
