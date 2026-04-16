@@ -72,6 +72,7 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
 
     let typingInterval: ReturnType<typeof setInterval> | undefined;
     let streamMsgId: number | undefined;
+    let streamMsgCreating = false;
     let streamStoppedEditing = false;
     try {
       await ctx.replyWithChatAction("typing");
@@ -81,6 +82,7 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
 
       const replyOpts = topicId ? { message_thread_id: topicId } : undefined;
       let statusMsgId: number | undefined;
+      let statusMsgCreating = false;
 
       const onUpdate = async (textSoFar: string) => {
         if (!textSoFar || textSoFar.length < 200 || streamStoppedEditing) return;
@@ -99,8 +101,15 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
 
         try {
           if (!streamMsgId) {
-            const msg = await ctx.reply(textSoFar, replyOpts);
-            streamMsgId = msg.message_id;
+            // Race guard: only one concurrent caller creates the streaming message
+            if (streamMsgCreating) return;
+            streamMsgCreating = true;
+            try {
+              const msg = await ctx.reply(textSoFar, replyOpts);
+              streamMsgId = msg.message_id;
+            } finally {
+              streamMsgCreating = false;
+            }
           } else {
             await ctx.api.editMessageText(ctx.chat.id, streamMsgId, textSoFar);
           }
@@ -110,8 +119,8 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
       };
 
       const onActivity = async (status: ActivityStatus) => {
-        // Don't send status updates if we already have streaming text
-        if (streamMsgId) return;
+        // Don't send status updates if we already have streaming text (or are creating one)
+        if (streamMsgId || streamMsgCreating) return;
 
         const elapsed = status.elapsed;
         const minutes = Math.floor(elapsed / 60);
@@ -121,8 +130,15 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
         if (statusMsgId) {
           await safeSend(() => ctx.api.editMessageText(ctx.chat.id, statusMsgId!, statusText));
         } else {
-          const msg = await safeSend(() => ctx.reply(statusText, replyOpts));
-          if (msg) statusMsgId = msg.message_id;
+          // Race guard: only one concurrent caller creates the status message
+          if (statusMsgCreating) return;
+          statusMsgCreating = true;
+          try {
+            const msg = await safeSend(() => ctx.reply(statusText, replyOpts));
+            if (msg) statusMsgId = msg.message_id;
+          } finally {
+            statusMsgCreating = false;
+          }
         }
       };
 

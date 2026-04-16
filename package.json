@@ -21,6 +21,7 @@
     "dev:web": "cd web && bun run dev",
     "prepublishOnly": "tsup && cd web && bun run build",
     "clawster": "bun run src/cli/index.ts",
+    "test": "bun test",
     "migrate:workspaces": "bun run scripts/migrate-workspaces.ts",
     "migrate:memory": "bun run scripts/migrate-memory.ts"
   },
