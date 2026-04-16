@@ -5,6 +5,7 @@ import { log } from "./logger.ts";
 import { registerTextHandler } from "./handlers/text-handler.ts";
 import { registerMediaHandlers } from "./handlers/media-handler.ts";
 import type { HandlerDeps } from "./handlers/types.ts";
+import { classifyTelegramError } from "./telegram-errors.ts";
 
 interface CreateBotOptions {
   botToken: string;
@@ -21,21 +22,60 @@ interface CreateBotOptions {
 export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runner, agentById }: CreateBotOptions) {
   const bot = new Bot(botToken);
 
-  // Install API-level error transformer — catch Telegram API errors (403, 400, etc.)
-  // before they can bubble up as unhandled exceptions and crash the process.
+  // Install API-level error transformer — classify Telegram API errors so we
+  // can differentiate between expected edit-failures, permanent chat failures
+  // (bot kicked/blocked/chat deleted), rate limits, and unknowns. Only the
+  // classified-safe categories are swallowed; unknowns are re-thrown so the
+  // bot middleware / handlers can react (and grammY's `bot.catch` will log).
   bot.api.config.use(async (prev, method, payload, signal) => {
     try {
       return await prev(method, payload, signal);
     } catch (err: any) {
-      const code = err?.error_code ?? 0;
-      const desc = err?.description ?? String(err);
-      // Swallow known non-fatal errors
-      if (code === 403 || code === 400) {
-        log.warn("telegram", `API error ${code} on ${method} (swallowed)`, { error: desc });
-        // Return a fake "ok" response so grammY doesn't throw
-        return { ok: true, result: true } as any;
+      const classified = classifyTelegramError(err, method);
+      const chatId = (payload as any)?.chat_id ?? "unknown";
+
+      switch (classified.kind) {
+        case "expected_edit":
+          // Streaming edit collided with an identical / stale target message —
+          // normal during live token streaming. Log at debug, return a truthy
+          // sentinel so grammY doesn't throw. (Note: callers that read
+          // `message_id` off the result will get undefined — which is fine for
+          // the edit paths because no further work depends on the new message.)
+          log.info("telegram", `Edit no-op on ${method}`, {
+            code: classified.code,
+            desc: classified.description,
+            chatId,
+          });
+          return { ok: true, result: true } as any;
+
+        case "permanent_chat":
+          // Bot was kicked, user blocked, chat deleted. Swallow so we don't
+          // crash — but log at warn so the user can spot dead chats in logs.
+          log.warn("telegram", `Chat unavailable on ${method} — suppressing`, {
+            code: classified.code,
+            desc: classified.description,
+            chatId,
+          });
+          return { ok: true, result: true } as any;
+
+        case "rate_limit":
+          // Let grammY's built-in auto-retry handle this by re-throwing.
+          log.warn("telegram", `Rate limited on ${method}`, {
+            code: classified.code,
+            desc: classified.description,
+            retryAfter: (err as any)?.parameters?.retry_after,
+          });
+          throw err;
+
+        case "unknown":
+        default:
+          log.error("telegram", `Unexpected API error on ${method}`, {
+            code: classified.code,
+            desc: classified.description,
+            chatId,
+          });
+          throw err;
       }
-      throw err; // Re-throw unknown errors
     }
   });
 
