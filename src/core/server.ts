@@ -5,7 +5,7 @@ import { createAgentRunner } from "./agent-runner.ts";
 import { createBot } from "./bot.ts";
 import { acquireLock, releaseLock } from "./lock.ts";
 import { log } from "./logger.ts";
-import { startHealthServer } from "./health.ts";
+import { startWebApi } from "./web-api.ts";
 import { startScheduler } from "./scheduler.ts";
 
 export async function startServer() {
@@ -40,6 +40,9 @@ export async function startServer() {
     agentById,
   });
 
+  // Mutable config reference for web API
+  let loaded = { config, agents, chatIdToAgent, agentById, defaultAgent };
+
   const maskedToken = config.botToken.slice(0, 6) + "..." + config.botToken.slice(-4);
   log.info("orchestrator", "Starting orchestrator", {
     agents: agentById.size,
@@ -50,7 +53,15 @@ export async function startServer() {
   bot.start({
     onStart: () => {
       log.info("orchestrator", "Bot is running!");
-      startHealthServer(agentById.size, config.healthPort);
+      startWebApi({
+        port: config.healthPort,
+        runner,
+        getConfig: () => loaded,
+        reloadConfig: async () => {
+          loaded = await loadConfig();
+          return loaded;
+        },
+      });
       startScheduler(agents.agents, runner, config.botToken, config.timezone);
     },
   });
@@ -64,4 +75,12 @@ export async function startServer() {
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+
+  // Never let uncaught errors crash the orchestrator
+  process.on("uncaughtException", (err) => {
+    log.error("orchestrator", "Uncaught exception (non-fatal)", { error: String(err) });
+  });
+  process.on("unhandledRejection", (err) => {
+    log.error("orchestrator", "Unhandled rejection (non-fatal)", { error: String(err) });
+  });
 }
