@@ -242,6 +242,15 @@ This machine runs the following agents (see agents.json for full config):
 - **Fisherman's Wife** — /Users/chriscrabtree/projects/fishermans-wife
 - **SocialManager** — /Users/chriscrabtree/projects/social-manager
 
+## Session Resume Protocol
+
+On every new session start, check `~/.clawster/worklog.json` for in-progress work. If it exists:
+1. Read it to understand what was being worked on
+2. Briefly tell Chris what you found and ask if he wants to resume
+3. After completing major milestones or before any expected restart, update the worklog
+
+The worklog tracks: active task, completed steps, next steps, and files changed. Keep it current — it's your lifeline across restarts.
+
 ## About Chris
 
 Chris Crabtree — 30+ year software engineer, serial entrepreneur. Mountain Time (MDT).
