@@ -1,5 +1,6 @@
 import { Bot } from "grammy";
 import type { AgentConfig, MessageContext } from "./types.ts";
+import type { ActivityStatus } from "./agent-runner.ts";
 import { buildPrompt } from "./prompt-builder.ts";
 import { sendResponse } from "./message-sender.ts";
 import { parseIntents, processIntents } from "./intent-parser.ts";
@@ -18,13 +19,42 @@ interface CreateBotOptions {
   resolveAgent: (chatId: string, isPrivate: boolean) => AgentConfig | null;
   runner: {
     run(agent: AgentConfig, prompt: string, opts?: { topicId?: number }): Promise<string>;
-    runStreaming(agent: AgentConfig, prompt: string, onUpdate: (textSoFar: string) => void, opts?: { topicId?: number; timeout?: number }): Promise<{ text: string; sessionId: string | null }>;
+    runStreaming(agent: AgentConfig, prompt: string, onUpdate: (textSoFar: string) => void, opts?: { topicId?: number; timeout?: number; onActivity?: (status: ActivityStatus) => void }): Promise<{ text: string; sessionId: string | null }>;
   };
   agentById: Map<string, AgentConfig>;
 }
 
+/** Safely send/edit Telegram messages — never throw on API errors. */
+async function safeSend(fn: () => Promise<any>): Promise<any> {
+  try {
+    return await fn();
+  } catch (err: any) {
+    const desc = err?.description ?? String(err);
+    log.warn("telegram", "API call failed (non-fatal)", { error: desc });
+    return null;
+  }
+}
+
 export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runner, agentById }: CreateBotOptions) {
   const bot = new Bot(botToken);
+
+  // Install API-level error transformer — catch Telegram API errors (403, 400, etc.)
+  // before they can bubble up as unhandled exceptions and crash the process.
+  bot.api.config.use(async (prev, method, payload, signal) => {
+    try {
+      return await prev(method, payload, signal);
+    } catch (err: any) {
+      const code = err?.error_code ?? 0;
+      const desc = err?.description ?? String(err);
+      // Swallow known non-fatal errors
+      if (code === 403 || code === 400) {
+        log.warn("telegram", `API error ${code} on ${method} (swallowed)`, { error: desc });
+        // Return a fake "ok" response so grammY doesn't throw
+        return { ok: true, result: true } as any;
+      }
+      throw err; // Re-throw unknown errors
+    }
+  });
 
   // Track chats currently in onboarding so we don't trigger discovery multiple times
   const onboardingChats = new Set<string>();
@@ -34,7 +64,7 @@ export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runn
   // Auth middleware — only allowed user can interact
   bot.use(async (ctx, next) => {
     if (ctx.from?.id.toString() !== allowedUserId) {
-      await ctx.reply("This bot is private.");
+      await safeSend(() => ctx.reply("This bot is private."));
       return;
     }
     await next();
@@ -228,6 +258,7 @@ Or if Chris declines: [SKIP_PROJECT]`;
       }, 5000);
 
       const replyOpts = topicId ? { message_thread_id: topicId } : undefined;
+      let statusMsgId: number | undefined;
 
       const onUpdate = async (textSoFar: string) => {
         if (!textSoFar || textSoFar.length < 200 || streamStoppedEditing) return;
@@ -236,6 +267,12 @@ Or if Chris declines: [SKIP_PROJECT]`;
         if (textSoFar.length > 4000) {
           streamStoppedEditing = true;
           return;
+        }
+
+        // If we had a status message, delete it now that we have real text
+        if (statusMsgId) {
+          await safeSend(() => ctx.api.deleteMessage(ctx.chat.id, statusMsgId!));
+          statusMsgId = undefined;
         }
 
         try {
@@ -250,7 +287,24 @@ Or if Chris declines: [SKIP_PROJECT]`;
         }
       };
 
-      const { text: response } = await runner.runStreaming(agent, prompt, onUpdate, { topicId });
+      const onActivity = async (status: ActivityStatus) => {
+        // Don't send status updates if we already have streaming text
+        if (streamMsgId) return;
+
+        const elapsed = status.elapsed;
+        const minutes = Math.floor(elapsed / 60);
+        const timeStr = minutes > 0 ? `${minutes}m ${elapsed % 60}s` : `${elapsed}s`;
+        const statusText = `${status.detail} (${timeStr})`;
+
+        if (statusMsgId) {
+          await safeSend(() => ctx.api.editMessageText(ctx.chat.id, statusMsgId!, statusText));
+        } else {
+          const msg = await safeSend(() => ctx.reply(statusText, replyOpts));
+          if (msg) statusMsgId = msg.message_id;
+        }
+      };
+
+      const { text: response } = await runner.runStreaming(agent, prompt, onUpdate, { topicId, onActivity });
 
       const { clean, intents } = parseIntents(response);
 
@@ -261,24 +315,27 @@ Or if Chris declines: [SKIP_PROJECT]`;
         });
       }
 
+      // Clean up status message if still showing
+      if (statusMsgId) {
+        await safeSend(() => ctx.api.deleteMessage(ctx.chat.id, statusMsgId!));
+      }
+
       // Final delivery: update streaming message or send full response
       if (streamMsgId && clean.length <= 4000) {
-        // Edit to final clean text (intents stripped, etc.)
         try {
           await ctx.api.editMessageText(ctx.chat.id, streamMsgId, clean);
         } catch {
           await sendResponse(ctx, clean, topicId);
         }
       } else {
-        // Delete partial message if it exists, send full response with chunking
         if (streamMsgId) {
-          await ctx.api.deleteMessage(ctx.chat.id, streamMsgId).catch(() => {});
+          await safeSend(() => ctx.api.deleteMessage(ctx.chat.id, streamMsgId!));
         }
         await sendResponse(ctx, clean, topicId);
       }
     } catch (err) {
       log.error(agent.id, "Error handling message", { error: String(err) });
-      await ctx.reply("Sorry, something went wrong processing your message.").catch(() => {});
+      await safeSend(() => ctx.reply("Sorry, something went wrong processing your message."));
     } finally {
       if (typingInterval) clearInterval(typingInterval);
     }
@@ -382,7 +439,7 @@ Or if Chris declines: [SKIP_PROJECT]`;
       }
     } catch (err) {
       log.error(agent.id, "Error handling photo", { error: String(err) });
-      await ctx.reply("Sorry, something went wrong processing your photo.").catch(() => {});
+      await safeSend(() => ctx.reply("Sorry, something went wrong processing your photo."));
     } finally {
       if (typingInterval) clearInterval(typingInterval);
       if (placeholderTimeout) clearTimeout(placeholderTimeout);
@@ -493,11 +550,144 @@ Or if Chris declines: [SKIP_PROJECT]`;
       }
     } catch (err) {
       log.error(agent.id, "Error handling voice message", { error: String(err) });
-      await ctx.reply("Sorry, something went wrong processing your voice message.").catch(() => {});
+      await safeSend(() => ctx.reply("Sorry, something went wrong processing your voice message."));
     } finally {
       if (typingInterval) clearInterval(typingInterval);
       if (placeholderTimeout) clearTimeout(placeholderTimeout);
     }
+  });
+
+  // Document/file handler
+  bot.on("message:document", async (ctx) => {
+    const chatId = ctx.chat.id.toString();
+    const isPrivate = ctx.chat.type === "private";
+    const chatTitle = "title" in ctx.chat ? ctx.chat.title : "DM";
+    let agent = resolveAgent(chatId, isPrivate);
+
+    if (!agent) {
+      // For documents, just try name-match — don't start full onboarding
+      const { chatIdToAgent, agentsConfig, defaultAgent } = getRouterState();
+      const match = findMatchingProject(chatTitle ?? "", agentsConfig.agents);
+      if (match) {
+        agent = await createAgentFromMatch(chatId, chatTitle ?? match.dirName, match.path, agentsConfig, chatIdToAgent);
+        agentById.set(agent.id, agent);
+      } else {
+        agent = defaultAgent;
+      }
+    }
+
+    const topicId = ctx.message.message_thread_id;
+    const topicName = resolveTopicName(agent, topicId, ctx);
+
+    if (topicId && topicName && !agent.topics?.[topicId.toString()]) {
+      await registerTopic(agent, topicId, topicName);
+    }
+
+    const messageContext: MessageContext = {
+      agentId: agent.id,
+      chatId,
+      topicId,
+      topicName,
+      isPrivate,
+    };
+
+    let typingInterval: ReturnType<typeof setInterval> | undefined;
+    let tempPath: string | undefined;
+    let placeholderMsgId: number | undefined;
+    let placeholderTimeout: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      const doc = ctx.message.document;
+      const originalName = doc.file_name ?? `document-${Date.now()}`;
+      const mimeType = doc.mime_type ?? "application/octet-stream";
+
+      // Download file from Telegram
+      const file = await ctx.api.getFile(doc.file_id);
+      if (!file.file_path) {
+        await safeSend(() => ctx.reply("Could not download the file — Telegram did not return a file path."));
+        return;
+      }
+
+      const fileUrl = `https://api.telegram.org/file/bot${botToken}/${file.file_path}`;
+      const response = await fetch(fileUrl);
+      if (!response.ok) {
+        await safeSend(() => ctx.reply("Failed to download the file from Telegram."));
+        return;
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      tempPath = join(tmpdir(), `tg-doc-${Date.now()}-${originalName}`);
+      await writeFile(tempPath, buffer);
+
+      log.info("orchestrator", "Document received", { chatId, agentId: agent.id, filename: originalName, mimeType, size: buffer.length });
+
+      const caption = ctx.message.caption ?? "";
+      const promptText = `[Document: ${originalName} (${mimeType})] saved to: ${tempPath}\n\n${caption}`;
+      const prompt = buildPrompt(agent, promptText, messageContext);
+
+      await ctx.replyWithChatAction("typing");
+      typingInterval = setInterval(() => {
+        ctx.replyWithChatAction("typing").catch(() => {});
+      }, 5000);
+
+      // After 15 seconds, send a placeholder so the user knows we're still working
+      const replyOpts = topicId ? { message_thread_id: topicId } : undefined;
+      placeholderTimeout = setTimeout(async () => {
+        try {
+          const msg = await ctx.reply("Thinking...", replyOpts);
+          placeholderMsgId = msg.message_id;
+        } catch {
+          // Non-critical
+        }
+      }, 15_000);
+
+      const result = await runner.run(agent, prompt, { topicId });
+
+      clearTimeout(placeholderTimeout);
+      placeholderTimeout = undefined;
+
+      const { clean, intents } = parseIntents(result);
+
+      if (intents.length > 0) {
+        processIntents(intents).catch((err) => {
+          log.error(agent.id, "Failed to process intents", { error: String(err) });
+        });
+      }
+
+      if (placeholderMsgId && clean.length <= 4000) {
+        try {
+          await ctx.api.editMessageText(ctx.chat.id, placeholderMsgId, clean);
+        } catch {
+          await sendResponse(ctx, clean, topicId);
+        }
+      } else {
+        if (placeholderMsgId) {
+          await ctx.api.deleteMessage(ctx.chat.id, placeholderMsgId).catch(() => {});
+        }
+        await sendResponse(ctx, clean, topicId);
+      }
+    } catch (err) {
+      log.error(agent.id, "Error handling document", { error: String(err) });
+      await safeSend(() => ctx.reply("Sorry, something went wrong processing your document."));
+    } finally {
+      if (typingInterval) clearInterval(typingInterval);
+      if (placeholderTimeout) clearTimeout(placeholderTimeout);
+      if (tempPath) {
+        unlink(tempPath).catch(() => {});
+      }
+    }
+  });
+
+  // Global error handler — never let an unhandled error crash the process
+  bot.catch((err) => {
+    const ctx = err.ctx;
+    const chatId = ctx?.chat?.id?.toString() ?? "unknown";
+    log.error("bot", "Unhandled error in bot middleware", {
+      chatId,
+      error: String(err.error),
+      message: err.message,
+    });
+    // Don't re-throw — the bot must keep running
   });
 
   return bot;

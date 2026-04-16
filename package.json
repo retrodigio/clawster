@@ -9,13 +9,17 @@
   "files": [
     "dist",
     "templates",
-    "README.md"
+    "README.md",
+    "web"
   ],
   "scripts": {
     "start": "bun run src/core/server.ts",
     "dev": "bun run --watch src/core/server.ts",
-    "build": "tsup",
-    "prepublishOnly": "tsup",
+    "build": "tsup && cd web && bun run build",
+    "build:backend": "tsup",
+    "build:web": "cd web && bun run build",
+    "dev:web": "cd web && bun run dev",
+    "prepublishOnly": "tsup && cd web && bun run build",
     "clawster": "bun run src/cli/index.ts",
     "migrate:workspaces": "bun run scripts/migrate-workspaces.ts",
     "migrate:memory": "bun run scripts/migrate-memory.ts"

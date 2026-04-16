@@ -27,6 +27,8 @@ export interface AgentConfig {
   topics?: Record<string, TopicConfig>;
   heartbeat?: HeartbeatConfig;
   tasks?: TaskConfig[];
+  inactivityTimeout?: number; // Per-agent inactivity timeout in seconds (default: 180)
+  extraArgs?: Record<string, string | null>; // Extra CLI args passed to Claude Code (null = boolean flag, string = value flag)
 }
 
 export interface OrchestratorConfig {
