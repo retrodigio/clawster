@@ -34,6 +34,7 @@ interface WebApiOptions {
   runner: AgentRunner;
   getConfig: () => LoadedConfig;
   reloadConfig: () => Promise<LoadedConfig>;
+  apiToken: string;
 }
 
 /** Parse JSON body safely. */
@@ -58,7 +59,7 @@ function err(message: string, status = 400): Response {
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
 function withCors(res: Response): Response {
@@ -69,9 +70,28 @@ function withCors(res: Response): Response {
 }
 
 export function startWebApi(options: WebApiOptions) {
-  const { port, runner } = options;
+  const { port, runner, apiToken } = options;
   let currentConfig = options.getConfig;
   const reloadConfig = options.reloadConfig;
+
+  /** Check Bearer token from Authorization header. */
+  function checkBearerAuth(req: Request): boolean {
+    const auth = req.headers.get("authorization");
+    if (!auth) return false;
+    const [scheme, token] = auth.split(" ");
+    return scheme === "Bearer" && token === apiToken;
+  }
+
+  /** Check token from query parameter (for WebSocket connections). */
+  function checkQueryAuth(url: URL): boolean {
+    return url.searchParams.get("token") === apiToken;
+  }
+
+  /** Check if request originates from localhost. */
+  function isLocalhost(req: Request): boolean {
+    const host = req.headers.get("host") || "";
+    return host.startsWith("localhost") || host.startsWith("127.0.0.1");
+  }
 
   // Track active WebSocket connections per agent
   const activeWsConnections = new Map<string, Set<{ ws: any; close: () => void }>>();
@@ -87,8 +107,16 @@ export function startWebApi(options: WebApiOptions) {
         return withCors(new Response(null, { status: 204 }));
       }
 
-      // WebSocket upgrade for chat
+      // Skip auth for health endpoint (monitoring)
+      // Skip auth for static files (web UI serves itself, uses token in API calls)
+      // Require auth for /api/* and /ws/*
+
+      // WebSocket upgrade for chat — authenticate via query param
       if (path.startsWith("/ws/chat/")) {
+        if (!checkQueryAuth(url)) {
+          return withCors(err("Unauthorized", 401));
+        }
+
         const agentId = path.split("/ws/chat/")[1];
         if (!agentId) return withCors(err("Missing agent ID"));
 
@@ -101,9 +129,16 @@ export function startWebApi(options: WebApiOptions) {
         return undefined as unknown as Response;
       }
 
-      // Serve static files for the web UI
+      // Serve static files for the web UI (no auth required)
       if (!path.startsWith("/api/") && !path.startsWith("/ws/") && path !== "/health") {
         return serveStatic(path);
+      }
+
+      // Auth check for /api/* endpoints (except /health and /api/auth/token)
+      if (path.startsWith("/api/") && path !== "/api/auth/token") {
+        if (!checkBearerAuth(req)) {
+          return withCors(err("Unauthorized", 401));
+        }
       }
 
       return handleApi(req, url, path);
@@ -208,6 +243,14 @@ export function startWebApi(options: WebApiOptions) {
 
   async function handleApi(req: Request, url: URL, path: string): Promise<Response> {
     const method = req.method;
+
+    // GET /api/auth/token — return token only to localhost requests
+    if (path === "/api/auth/token" && method === "GET") {
+      if (!isLocalhost(req)) {
+        return withCors(err("Forbidden — token only available from localhost", 403));
+      }
+      return withCors(json({ token: apiToken }));
+    }
 
     // Health
     if (path === "/health") {
@@ -339,12 +382,16 @@ export function startWebApi(options: WebApiOptions) {
       return withCors(json({ ok: true }));
     }
 
-    // GET /api/config — read config (masks bot token)
+    // GET /api/config — read config (masks secrets)
     if (path === "/api/config" && method === "GET") {
       const cfg = currentConfig();
+      const maskedGroqKey = cfg.config.groqKey
+        ? cfg.config.groqKey.slice(0, 4) + "..." + cfg.config.groqKey.slice(-4)
+        : "";
       return withCors(json({
         ...cfg.config,
         botToken: cfg.config.botToken.slice(0, 6) + "..." + cfg.config.botToken.slice(-4),
+        groqKey: maskedGroqKey,
       }));
     }
 
@@ -393,6 +440,7 @@ export function startWebApi(options: WebApiOptions) {
     return withCors(err("Not found", 404));
   }
 
-  log.info("web-api", `Web API server listening on port ${port}`);
+  const tokenPath = join(getClawsterHome(), "api-token");
+  log.info("web-api", `Web API server listening on port ${port}`, { apiTokenPath: tokenPath });
   return server;
 }

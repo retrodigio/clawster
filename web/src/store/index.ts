@@ -3,6 +3,9 @@ import {
   fetchAgents,
   fetchSessions,
   fetchStatus,
+  fetchAuthToken,
+  setAuthToken,
+  getAuthToken,
   type Agent,
   type Session,
   type SystemStatus,
@@ -34,6 +37,7 @@ interface AppState {
   ws: WebSocket | null;
 
   // Actions
+  initAuth(): Promise<void>;
   loadAll(): Promise<void>;
   loadAgents(): Promise<void>;
   loadSessions(): Promise<void>;
@@ -70,6 +74,15 @@ export const useStore = create<AppState>((set, get) => ({
   streamText: '',
   ws: null,
 
+  initAuth: async () => {
+    try {
+      const token = await fetchAuthToken();
+      setAuthToken(token);
+    } catch {
+      console.error('Failed to fetch auth token — API calls will be unauthenticated');
+    }
+  },
+
   loadAgents: async () => {
     try {
       const agents = await fetchAgents();
@@ -98,6 +111,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   loadAll: async () => {
+    await get().initAuth();
     await Promise.all([get().loadAgents(), get().loadSessions(), get().loadStatus()]);
   },
 
@@ -117,7 +131,9 @@ export const useStore = create<AppState>((set, get) => ({
   connectWs: (agentId: string) => {
     get().disconnectWs();
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/chat/${agentId}`);
+    const token = getAuthToken();
+    const tokenParam = token ? `?token=${encodeURIComponent(token)}` : '';
+    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/chat/${agentId}${tokenParam}`);
 
     ws.onmessage = (rawEvent) => {
       const data: WsMessage = JSON.parse(rawEvent.data);

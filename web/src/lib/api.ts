@@ -42,8 +42,30 @@ export interface ConversationEvent {
   data: Record<string, unknown>;
 }
 
+let _authToken: string | null = null;
+
+export function setAuthToken(token: string) {
+  _authToken = token;
+}
+
+export function getAuthToken(): string | null {
+  return _authToken;
+}
+
+/** Fetch the API auth token from the server (only works from localhost). */
+export async function fetchAuthToken(): Promise<string> {
+  const res = await fetch('/api/auth/token');
+  if (!res.ok) throw new Error(`Failed to fetch auth token: ${res.status}`);
+  const data = await res.json() as { token: string };
+  return data.token;
+}
+
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
+  const headers = new Headers(init?.headers);
+  if (_authToken) {
+    headers.set('Authorization', `Bearer ${_authToken}`);
+  }
+  const res = await fetch(url, { ...init, headers });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json() as Promise<T>;
 }
