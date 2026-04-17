@@ -2,31 +2,63 @@ import { query, type Query, type Options } from "@anthropic-ai/claude-agent-sdk"
 import { log } from "./logger.ts";
 import type { AgentConfig } from "./types.ts";
 import { getSession, saveSession } from "./session-store.ts";
+import {
+  messagesTotal,
+  queryDurationSeconds,
+  semaphoreQueueDepth,
+  semaphoreInFlight,
+} from "./metrics.ts";
+
+export type QueryPriority = "high" | "low";
 
 type QueuedResolve = () => void;
 
+/**
+ * Priority-aware semaphore.
+ * - Two FIFO queues: "high" (user messages) and "low" (heartbeats/scheduled).
+ * - When a slot opens, oldest "high" is dequeued first, then oldest "low".
+ */
 function createSemaphore(max: number) {
   let active = 0;
-  const queue: QueuedResolve[] = [];
+  const highQueue: QueuedResolve[] = [];
+  const lowQueue: QueuedResolve[] = [];
 
-  function acquire(): Promise<void> {
+  function updateDepthGauges(): void {
+    semaphoreQueueDepth.set(highQueue.length, { priority: "high" });
+    semaphoreQueueDepth.set(lowQueue.length, { priority: "low" });
+    semaphoreInFlight.set(active);
+  }
+
+  function acquire(priority: QueryPriority): Promise<void> {
     if (active < max) {
       active++;
+      updateDepthGauges();
       return Promise.resolve();
     }
     return new Promise<void>((resolve) => {
-      queue.push(resolve);
+      if (priority === "high") {
+        highQueue.push(resolve);
+      } else {
+        lowQueue.push(resolve);
+      }
+      updateDepthGauges();
     });
   }
 
   function release(): void {
-    if (queue.length > 0) {
-      const next = queue.shift()!;
+    // Drain high before low.
+    const next = highQueue.shift() ?? lowQueue.shift();
+    if (next) {
+      // Slot handed off — in-flight count stays the same.
       next();
     } else {
       active--;
     }
+    updateDepthGauges();
   }
+
+  // Initialise gauges at zero.
+  updateDepthGauges();
 
   return { acquire, release };
 }
@@ -245,7 +277,7 @@ export function createAgentRunner(options: {
   async function run(
     agent: AgentConfig,
     prompt: string,
-    runOptions?: { topicId?: number; timeout?: number },
+    runOptions?: { topicId?: number; timeout?: number; priority?: QueryPriority },
   ): Promise<string> {
     if (isShuttingDown) {
       throw new Error("Runner is shutting down — not accepting new queries");
@@ -253,6 +285,7 @@ export function createAgentRunner(options: {
     const inactivityTimeout = (agent.inactivityTimeout ?? 180) * 1000; // Default 3 min inactivity
     const maxTimeout = runOptions?.timeout ?? 1_800_000; // 30 min max
     const agentKey = getAgentKey(agent.id, runOptions?.topicId);
+    const priority: QueryPriority = runOptions?.priority ?? "high";
 
     const prev = agentMutex.get(agentKey) ?? Promise.resolve();
     let releaseMutex: () => void;
@@ -264,8 +297,10 @@ export function createAgentRunner(options: {
     await prev;
 
     try {
-      await semaphore.acquire();
+      await semaphore.acquire(priority);
 
+      const queryStart = Date.now();
+      let outcome: "success" | "error" | "timeout" = "success";
       try {
         const session = await getSession(agent.id, runOptions?.topicId);
         const resumeSessionId = session?.sessionId ?? null;
@@ -276,6 +311,7 @@ export function createAgentRunner(options: {
           hasSession: !!resumeSessionId,
           inactivityTimeout,
           maxTimeout,
+          priority,
         });
 
         const abortController = new AbortController();
@@ -317,6 +353,7 @@ export function createAgentRunner(options: {
                 messageCount: session?.messageCount ?? 0,
               }, runOptions?.topicId);
             }
+            outcome = "timeout";
             return "Sorry, the request timed out. Please try again with a simpler question.";
           }
 
@@ -336,9 +373,16 @@ export function createAgentRunner(options: {
           return resultText.trim();
         } catch (err) {
           timer.clear();
+          outcome = "error";
           throw err;
         }
+      } catch (err) {
+        if (outcome === "success") outcome = "error";
+        throw err;
       } finally {
+        const elapsedSeconds = (Date.now() - queryStart) / 1000;
+        queryDurationSeconds.observe(elapsedSeconds, { agent: agent.id, priority });
+        messagesTotal.inc({ agent: agent.id, priority, outcome });
         semaphore.release();
       }
     } finally {
@@ -358,6 +402,7 @@ export function createAgentRunner(options: {
     runOptions?: {
       topicId?: number;
       timeout?: number;
+      priority?: QueryPriority;
       onActivity?: (status: ActivityStatus) => void;
       onEvent?: (event: ConversationEvent) => void;
     },
@@ -368,6 +413,7 @@ export function createAgentRunner(options: {
     const inactivityTimeout = (agent.inactivityTimeout ?? 180) * 1000; // Default 3 min inactivity
     const maxTimeout = runOptions?.timeout ?? 1_800_000; // 30 min max
     const agentKey = getAgentKey(agent.id, runOptions?.topicId);
+    const priority: QueryPriority = runOptions?.priority ?? "high";
 
     const interruptedSessionId = await interruptIfRunning(agentKey);
 
@@ -381,8 +427,10 @@ export function createAgentRunner(options: {
     await prev;
 
     try {
-      await semaphore.acquire();
+      await semaphore.acquire(priority);
 
+      const queryStart = Date.now();
+      let outcome: "success" | "error" | "timeout" = "success";
       try {
         const session = await getSession(agent.id, runOptions?.topicId);
         const resumeSessionId = interruptedSessionId ?? session?.sessionId ?? null;
@@ -394,6 +442,7 @@ export function createAgentRunner(options: {
           interrupted: !!interruptedSessionId,
           inactivityTimeout,
           maxTimeout,
+          priority,
         });
 
         const abortController = new AbortController();
@@ -532,6 +581,7 @@ export function createAgentRunner(options: {
                 messageCount: session?.messageCount ?? 0,
               }, runOptions?.topicId);
             }
+            outcome = "timeout";
             return {
               text: `The agent was working for ${timer.elapsed}s but became unresponsive. Session is saved — send another message to resume.`,
               sessionId,
@@ -555,9 +605,16 @@ export function createAgentRunner(options: {
         } catch (err) {
           timer.clear();
           activeQueries.delete(agentKey);
+          outcome = "error";
           throw err;
         }
+      } catch (err) {
+        if (outcome === "success") outcome = "error";
+        throw err;
       } finally {
+        const elapsedSeconds = (Date.now() - queryStart) / 1000;
+        queryDurationSeconds.observe(elapsedSeconds, { agent: agent.id, priority });
+        messagesTotal.inc({ agent: agent.id, priority, outcome });
         semaphore.release();
       }
     } finally {

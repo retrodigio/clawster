@@ -12,10 +12,15 @@ import {
 } from "./config.ts";
 import { getSession, clearSession } from "./session-store.ts";
 import type { AgentConfig } from "./types.ts";
-import type { ActivityStatus, ConversationEvent } from "./agent-runner.ts";
+import type { ActivityStatus, ConversationEvent, QueryPriority } from "./agent-runner.ts";
+import { renderMetrics, agentsConfigured, sessionsActive } from "./metrics.ts";
 
 type AgentRunner = {
-  run: (agent: AgentConfig, prompt: string, options?: { topicId?: number; timeout?: number }) => Promise<string>;
+  run: (
+    agent: AgentConfig,
+    prompt: string,
+    options?: { topicId?: number; timeout?: number; priority?: QueryPriority },
+  ) => Promise<string>;
   runStreaming: (
     agent: AgentConfig,
     prompt: string,
@@ -23,6 +28,7 @@ type AgentRunner = {
     options?: {
       topicId?: number;
       timeout?: number;
+      priority?: QueryPriority;
       onActivity?: (status: ActivityStatus) => void;
       onEvent?: (event: ConversationEvent) => void;
     },
@@ -108,8 +114,28 @@ export function startWebApi(options: WebApiOptions) {
       }
 
       // Skip auth for health endpoint (monitoring)
+      // Skip auth for /metrics (standard Prometheus scrape convention)
       // Skip auth for static files (web UI serves itself, uses token in API calls)
       // Require auth for /api/* and /ws/*
+
+      // Prometheus metrics endpoint — unauthenticated (standard scrape convention; localhost-only by default).
+      if (path === "/metrics" && req.method === "GET") {
+        return (async () => {
+          try {
+            const cfg = currentConfig();
+            agentsConfigured.set(cfg.agentById.size);
+            const sessionsDir = join(getClawsterHome(), "sessions");
+            try {
+              const files = await readdir(sessionsDir);
+              sessionsActive.set(files.filter((f) => f.endsWith(".json")).length);
+            } catch { /* sessions dir may not exist yet */ }
+          } catch { /* best-effort refresh */ }
+          return withCors(new Response(renderMetrics(), {
+            status: 200,
+            headers: { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" },
+          }));
+        })();
+      }
 
       // WebSocket upgrade for chat — authenticate via query param
       if (path.startsWith("/ws/chat/")) {
