@@ -27,6 +27,16 @@ function getPlistPath(): string {
   return join(getLaunchAgentsDir(), PLIST_NAME);
 }
 
+/** Escape a string for safe inclusion in an XML <string> body. */
+function xmlEscape(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 function generatePlist(bunPath: string, cliPath: string, home: string): string {
   const logsDir = join(home, "logs");
   const userHome = homedir();
@@ -42,28 +52,29 @@ function generatePlist(bunPath: string, cliPath: string, home: string): string {
   if (bunDir) pathDirs.add(bunDir);
 
   const pathString = [...pathDirs].join(":");
+  const x = xmlEscape;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${LABEL}</string>
+  <string>${x(LABEL)}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${bunPath}</string>
-    <string>${cliPath}</string>
+    <string>${x(bunPath)}</string>
+    <string>${x(cliPath)}</string>
     <string>start</string>
     <string>--foreground</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>${home}</string>
+  <string>${x(home)}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>${pathString}</string>
+    <string>${x(pathString)}</string>
     <key>HOME</key>
-    <string>${userHome}</string>
+    <string>${x(userHome)}</string>
   </dict>
   <key>KeepAlive</key>
   <true/>
@@ -72,9 +83,9 @@ function generatePlist(bunPath: string, cliPath: string, home: string): string {
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>${join(logsDir, "clawster.log")}</string>
+  <string>${x(join(logsDir, "clawster.log"))}</string>
   <key>StandardErrorPath</key>
-  <string>${join(logsDir, "clawster.error.log")}</string>
+  <string>${x(join(logsDir, "clawster.error.log"))}</string>
 </dict>
 </plist>`;
 }
@@ -171,6 +182,9 @@ function generateSystemdUnit(bunPath: string, cliPath: string, home: string): st
   const bunDir = bunPath.substring(0, bunPath.lastIndexOf("/"));
   if (bunDir && !pathDirs.includes(bunDir)) pathDirs.unshift(bunDir);
 
+  // systemd Environment= values are parsed with shell-like quoting. Wrap in
+  // double quotes so values containing spaces (home dir with space, weird paths)
+  // are handled correctly. Quote ExecStart fields too.
   return `[Unit]
 Description=Clawster AI Agent Orchestrator
 After=network-online.target
@@ -178,10 +192,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${bunPath} ${cliPath} start --foreground
+ExecStart="${bunPath}" "${cliPath}" start --foreground
 WorkingDirectory=${home}
-Environment=PATH=${pathDirs.join(":")}
-Environment=HOME=${userHome}
+Environment="PATH=${pathDirs.join(":")}"
+Environment="HOME=${userHome}"
 Restart=on-failure
 RestartSec=10
 StandardOutput=append:${join(logsDir, "clawster.log")}
