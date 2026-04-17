@@ -719,7 +719,7 @@ export function createAgentRunner(options: {
                 const now = Date.now();
                 if (now - lastUpdateTime >= 2000) {
                   lastUpdateTime = now;
-                  onUpdate(accumulated);
+                  await onUpdate(accumulated);
                 }
                 emitEvent?.("text_delta", { text: evt.delta.text, accumulated });
               }
@@ -743,7 +743,7 @@ export function createAgentRunner(options: {
                 if (now - lastActivityTime >= 10_000) {
                   lastActivityTime = now;
                   const elapsed = Math.round((now - startTime) / 1000);
-                  runOptions.onActivity({
+                  await runOptions.onActivity({
                     type: description.includes("Thinking") ? "thinking" : "tool_use",
                     detail: description,
                     elapsed,
