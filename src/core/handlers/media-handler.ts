@@ -11,7 +11,7 @@ import { writeFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { HandlerDeps } from "./types.ts";
-import { safeSend, resolveTopicName } from "./shared.ts";
+import { safeSend, safeReact, resolveTopicName } from "./shared.ts";
 
 /**
  * Resolve agent for media messages, handling the async agent creation case.
@@ -113,8 +113,11 @@ async function handleMediaMessage(
       }
       await sendResponse(ctx, clean, topicId);
     }
+
+    await safeReact(ctx, "✅");
   } catch (err) {
     log.error(agent.id, `Error handling ${mediaType}`, { error: String(err) });
+    await safeReact(ctx, "❌");
     await safeSend(() => ctx.reply(`Sorry, something went wrong processing your ${mediaType}.`));
   } finally {
     if (typingInterval) clearInterval(typingInterval);
@@ -125,6 +128,7 @@ async function handleMediaMessage(
 export function registerMediaHandlers(bot: Bot, deps: HandlerDeps): void {
   // Photo handler
   bot.on("message:photo", async (ctx) => {
+    await safeReact(ctx, "👀");
     const chatId = ctx.chat.id.toString();
     const isPrivate = ctx.chat.type === "private";
     const chatTitle = ("title" in ctx.chat ? ctx.chat.title : "DM") ?? "DM";
@@ -159,6 +163,7 @@ export function registerMediaHandlers(bot: Bot, deps: HandlerDeps): void {
 
   // Voice message handler
   bot.on("message:voice", async (ctx) => {
+    await safeReact(ctx, "👀");
     const chatId = ctx.chat.id.toString();
     const isPrivate = ctx.chat.type === "private";
     const chatTitle = ("title" in ctx.chat ? ctx.chat.title : "DM") ?? "DM";
@@ -189,12 +194,14 @@ export function registerMediaHandlers(bot: Bot, deps: HandlerDeps): void {
       await handleMediaMessage(ctx, agent, promptText, topicId, topicName, "voice message", deps);
     } catch (err) {
       log.error(agent.id, "Error handling voice message", { error: String(err) });
+      await safeReact(ctx, "❌");
       await safeSend(() => ctx.reply("Sorry, something went wrong processing your voice message."));
     }
   });
 
   // Document/file handler
   bot.on("message:document", async (ctx) => {
+    await safeReact(ctx, "👀");
     const chatId = ctx.chat.id.toString();
     const isPrivate = ctx.chat.type === "private";
     const chatTitle = ("title" in ctx.chat ? ctx.chat.title : "DM") ?? "DM";

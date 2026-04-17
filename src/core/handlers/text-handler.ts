@@ -7,7 +7,7 @@ import { parseIntents, processIntents } from "../intent-parser.ts";
 import { log } from "../logger.ts";
 import { registerTopic } from "../router.ts";
 import type { HandlerDeps } from "./types.ts";
-import { safeSend, resolveTopicName } from "./shared.ts";
+import { safeSend, safeReact, resolveTopicName } from "./shared.ts";
 import { handleDiscovery } from "./onboarding-handler.ts";
 
 export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
@@ -19,6 +19,9 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
 
     const chatTitle = "title" in ctx.chat ? ctx.chat.title : "DM";
     log.info("orchestrator", "Message received", { chatId, chatTitle, chatType: ctx.chat.type, isPrivate });
+
+    // Instant acknowledgement: mark the message as seen
+    await safeReact(ctx, "👀");
 
     let agent = resolveAgent(chatId, isPrivate);
 
@@ -171,8 +174,11 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
         }
         await sendResponse(ctx, clean, topicId);
       }
+
+      await safeReact(ctx, "✅");
     } catch (err) {
       log.error(agent.id, "Error handling message", { error: String(err) });
+      await safeReact(ctx, "❌");
       await safeSend(() => ctx.reply("Sorry, something went wrong processing your message."));
     } finally {
       if (typingInterval) clearInterval(typingInterval);

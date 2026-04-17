@@ -12,6 +12,15 @@ export async function safeSend(fn: () => Promise<any>): Promise<any> {
   }
 }
 
+/** Safely set a message reaction — never throw if Telegram rejects it. */
+export async function safeReact(ctx: any, emoji: string): Promise<void> {
+  try {
+    await ctx.react(emoji);
+  } catch (err: any) {
+    log.warn("telegram", "Reaction failed (non-fatal)", { emoji, error: err?.description ?? String(err) });
+  }
+}
+
 /** Resolve topic name from config or Telegram metadata. */
 export function resolveTopicName(agent: AgentConfig, topicId: number | undefined, ctx: any): string | undefined {
   if (!topicId) return undefined;
