@@ -4,6 +4,7 @@ import type { ActivityStatus } from "./agent-runner.ts";
 import { log } from "./logger.ts";
 import { registerTextHandler } from "./handlers/text-handler.ts";
 import { registerMediaHandlers } from "./handlers/media-handler.ts";
+import { registerCommandHandler } from "./handlers/command-handler.ts";
 import type { HandlerDeps } from "./handlers/types.ts";
 import { classifyTelegramError } from "./telegram-errors.ts";
 
@@ -102,7 +103,9 @@ export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runn
     groqKey,
   };
 
-  // Register all message handlers
+  // Register all message handlers. Command handler first so `/help` etc.
+  // take precedence over the generic text handler.
+  registerCommandHandler(bot, deps);
   registerTextHandler(bot, deps);
   registerMediaHandlers(bot, deps);
 
