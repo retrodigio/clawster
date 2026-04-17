@@ -20,6 +20,47 @@ interface CreateBotOptions {
   agentById: Map<string, AgentConfig>;
 }
 
+export type AuthDecision =
+  | { allow: true; reason: "owner" | "mapped_group"; agent?: AgentConfig | null }
+  | { allow: false; reason: "no_from" | "not_owner_dm" | "not_owner_unmapped_group" | "not_owner_channel" };
+
+/**
+ * Decide whether a Telegram update should be allowed through the auth gate.
+ *
+ * Rules:
+ *  - DMs (private chats): owner-only.
+ *  - Group / supergroup: owner always allowed. Non-owners allowed iff the chat
+ *    is mapped to a configured agent (someone Chris intentionally added to the
+ *    agent's group can talk to that agent).
+ *  - Channel posts, unmapped groups, unknown chat types: owner-only.
+ */
+export function decideAuth(params: {
+  fromId: string | undefined;
+  chatId: string | undefined;
+  chatType: "private" | "group" | "supergroup" | "channel" | undefined;
+  allowedUserId: string;
+  resolveAgent: (chatId: string, isPrivate: boolean) => AgentConfig | null;
+}): AuthDecision {
+  const { fromId, chatId, chatType, allowedUserId, resolveAgent } = params;
+
+  if (!fromId) return { allow: false, reason: "no_from" };
+
+  const isOwner = fromId === allowedUserId;
+  if (isOwner) return { allow: true, reason: "owner" };
+
+  const isGroup = chatType === "group" || chatType === "supergroup";
+  if (!isGroup || !chatId) {
+    // DMs and channel posts fall back to owner-only.
+    if (chatType === "channel") return { allow: false, reason: "not_owner_channel" };
+    return { allow: false, reason: "not_owner_dm" };
+  }
+
+  const agent = resolveAgent(chatId, false);
+  if (agent) return { allow: true, reason: "mapped_group", agent };
+
+  return { allow: false, reason: "not_owner_unmapped_group" };
+}
+
 export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runner, agentById }: CreateBotOptions) {
   const bot = new Bot(botToken);
 
@@ -80,9 +121,21 @@ export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runn
     }
   });
 
-  // Auth middleware — only allowed user can interact
+  // Auth middleware — owner everywhere; non-owners only in mapped group chats.
   bot.use(async (ctx, next) => {
-    if (ctx.from?.id.toString() !== allowedUserId) {
+    const fromId = ctx.from?.id.toString();
+    const chatId = ctx.chat?.id.toString();
+    const chatType = ctx.chat?.type;
+
+    const decision = decideAuth({
+      fromId,
+      chatId,
+      chatType,
+      allowedUserId,
+      resolveAgent,
+    });
+
+    if (!decision.allow) {
       try {
         await ctx.reply("This bot is private.");
       } catch (err: any) {
@@ -90,6 +143,16 @@ export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runn
       }
       return;
     }
+
+    if (decision.reason === "mapped_group") {
+      log.info("auth", "Non-owner in mapped group", {
+        chatId,
+        agentId: decision.agent?.id,
+        fromId,
+        fromUsername: ctx.from?.username,
+      });
+    }
+
     await next();
   });
 
