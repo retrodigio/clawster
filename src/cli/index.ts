@@ -19,6 +19,7 @@ program
 import { initCommand } from "./init.ts";
 import { startCommand } from "./start.ts";
 import { stopCommand } from "./stop.ts";
+import { restartCommand } from "./restart.ts";
 import { statusCommand } from "./status.ts";
 import { logsCommand } from "./logs.ts";
 import { agentCommand } from "./agent.ts";
@@ -29,6 +30,7 @@ import { migrateCommand } from "./migrate.ts";
 program.addCommand(initCommand);
 program.addCommand(startCommand);
 program.addCommand(stopCommand);
+program.addCommand(restartCommand);
 program.addCommand(statusCommand);
 program.addCommand(logsCommand);
 program.addCommand(agentCommand);
