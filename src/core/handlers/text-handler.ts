@@ -16,9 +16,12 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
   bot.on("message:text", async (ctx) => {
     const chatId = ctx.chat.id.toString();
     const isPrivate = ctx.chat.type === "private";
+    // Correlation ID for duplicate-response debugging. Every send/edit/delete
+    // is tagged with this so we can replay a single request's full lifecycle.
+    const reqId = crypto.randomUUID().slice(0, 8);
 
     const chatTitle = "title" in ctx.chat ? ctx.chat.title : "DM";
-    log.info("orchestrator", "Message received", { chatId, chatTitle, chatType: ctx.chat.type, isPrivate });
+    log.info("orchestrator", "Message received", { reqId, chatId, chatTitle, chatType: ctx.chat.type, isPrivate, msgId: ctx.message.message_id });
 
     // Instant acknowledgement: mark the message as seen
     await safeReact(ctx, "👀");
@@ -61,7 +64,7 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
       await registerTopic(agent, topicId, topicName);
     }
 
-    log.info("orchestrator", "Routed to agent", { chatId, agentId: agent.id, topicId: topicId ?? null, topicName: topicName ?? null });
+    log.info("orchestrator", "Routed to agent", { reqId, chatId, agentId: agent.id, topicId: topicId ?? null, topicName: topicName ?? null });
 
     const messageContext: MessageContext = {
       agentId: agent.id,
@@ -108,16 +111,19 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
             if (streamMsgCreating) return;
             streamMsgCreating = true;
             try {
+              log.info("send", "reply: stream create", { reqId, source: "onUpdate", chatId, len: textSoFar.length });
               const msg = await ctx.reply(textSoFar, replyOpts);
-              streamMsgId = msg.message_id;
+              streamMsgId = msg?.message_id;
+              log.info("send", "reply: stream created", { reqId, source: "onUpdate", chatId, messageId: streamMsgId, replyResultType: typeof msg });
             } finally {
               streamMsgCreating = false;
             }
           } else {
+            log.info("send", "edit: stream update", { reqId, source: "onUpdate", chatId, messageId: streamMsgId, len: textSoFar.length });
             await ctx.api.editMessageText(ctx.chat.id, streamMsgId, textSoFar);
           }
-        } catch {
-          // Telegram edit failed — skip this update, try next time
+        } catch (err: any) {
+          log.warn("send", "stream send/edit failed", { reqId, source: "onUpdate", error: err?.description ?? String(err) });
         }
       };
 
@@ -162,16 +168,22 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
       }
 
       // Final delivery: update streaming message or send full response
+      log.info("send", "final delivery entry", { reqId, chatId, hasStreamMsg: !!streamMsgId, streamMsgId, streamMsgCreating, cleanLen: clean.length });
       if (streamMsgId && clean.length <= 4000) {
         try {
+          log.info("send", "edit: final", { reqId, source: "final", chatId, messageId: streamMsgId, len: clean.length });
           await ctx.api.editMessageText(ctx.chat.id, streamMsgId, clean);
-        } catch {
+        } catch (err: any) {
+          log.warn("send", "final edit failed — falling back to sendResponse", { reqId, error: err?.description ?? String(err) });
+          log.info("send", "reply: sendResponse (fallback)", { reqId, source: "final-fallback", chatId, len: clean.length });
           await sendResponse(ctx, clean, topicId);
         }
       } else {
         if (streamMsgId) {
+          log.info("send", "delete: stream msg (too long for edit)", { reqId, chatId, messageId: streamMsgId });
           await safeSend(() => ctx.api.deleteMessage(ctx.chat.id, streamMsgId!));
         }
+        log.info("send", "reply: sendResponse", { reqId, source: "final-send", chatId, len: clean.length });
         await sendResponse(ctx, clean, topicId);
       }
 
