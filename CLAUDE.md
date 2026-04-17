@@ -227,6 +227,36 @@ When you (the Clawster agent) learn something important about a project or Chris
 - **Sessions** — Persisted at `~/.clawster/sessions/<agentId>.json` (or `<agentId>_topic_<topicId>.json`)
 - **PID lock** — `~/.clawster/orchestrator.lock` prevents duplicate instances
 
+## Operations
+
+### Log rotation
+
+Clawster's `src/core/logger.ts` writes structured JSON to **stdout** only — it never opens log files itself. The daemon's log files at `~/.clawster/logs/clawster.log` and `~/.clawster/logs/clawster.error.log` are owned by launchd (via `StandardOutPath` / `StandardErrorPath` in `~/Library/LaunchAgents/com.clawster.daemon.plist`). Rotating those files from inside the Clawster process is therefore not possible — launchd holds the file descriptors.
+
+Log rotation is the **operator's responsibility** and must be handled by the OS:
+
+- **macOS** — use `newsyslog` (built in). Install by running `scripts/install-log-rotation.sh`, which drops a config into `/etc/newsyslog.d/clawster.conf`. The default policy rotates at 10 MB and keeps 5 gzip-compressed generations (`clawster.log.0.gz` … `clawster.log.4.gz`).
+- **Linux (systemd)** — use `logrotate`. Equivalent `/etc/logrotate.d/clawster` snippet:
+  ```
+  /home/YOU/.clawster/logs/*.log {
+      size 10M
+      rotate 5
+      compress
+      missingok
+      notifempty
+      copytruncate
+  }
+  ```
+  `copytruncate` is important here: journald/launchd-equivalent supervisors keep the descriptor open, so the rotator must truncate in place rather than rename.
+
+The macOS `newsyslog.conf` syntax used by the install script is:
+```
+# logfilename              [owner:group]  mode count size  when  flags
+/Users/YOU/.clawster/logs/clawster.log       644  5    10240 *   JG
+/Users/YOU/.clawster/logs/clawster.error.log 644  5    10240 *   JG
+```
+Flags: `J` = compress with bzip2 (use `Z` for gzip), `G` = signal a group. Size is in KB, so `10240` = 10 MB. `*` in the `when` column means size-only trigger.
+
 ## Current Agent Fleet
 
 This machine runs the following agents (see agents.json for full config):
