@@ -3,7 +3,11 @@ import { matchesCron, getNextMatch } from "./cron.ts";
 import type { AgentConfig, TaskConfig } from "./types.ts";
 
 type Runner = {
-  run(agent: AgentConfig, prompt: string, opts?: { timeout?: number }): Promise<string>;
+  run(
+    agent: AgentConfig,
+    prompt: string,
+    opts?: { timeout?: number; priority?: "high" | "low" },
+  ): Promise<string>;
 };
 
 /** Convert a time zone to a Date representing the current wall-clock time in that zone. */
@@ -164,7 +168,7 @@ export function startScheduler(agents: AgentConfig[], runner: Runner, botToken: 
       // Fire and forget — don't block the tick loop
       (async () => {
         try {
-          const response = await runner.run(agent, task.prompt, { timeout: 120_000 });
+          const response = await runner.run(agent, task.prompt, { timeout: 120_000, priority: "low" });
           const trimmed = response.trim();
 
           if (trimmed === "NO_CHECKIN" || trimmed.startsWith("NO_CHECKIN") || trimmed === "") {
