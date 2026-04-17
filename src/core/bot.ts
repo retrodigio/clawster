@@ -7,6 +7,7 @@ import { registerMediaHandlers } from "./handlers/media-handler.ts";
 import { registerCommandHandler } from "./handlers/command-handler.ts";
 import type { HandlerDeps } from "./handlers/types.ts";
 import { classifyTelegramError } from "./telegram-errors.ts";
+import { unbindDeadChat } from "./router.ts";
 
 interface CreateBotOptions {
   botToken: string;
@@ -92,12 +93,21 @@ export function createBot({ botToken, allowedUserId, groqKey, resolveAgent, runn
 
         case "permanent_chat":
           // Bot was kicked, user blocked, chat deleted. Swallow so we don't
-          // crash — but log at warn so the user can spot dead chats in logs.
+          // crash — log at warn AND auto-unbind the chat from its agent so we
+          // stop sending heartbeats / retrying to a dead target. Fire-and-forget
+          // so the transformer can return promptly.
           log.warn("telegram", `Chat unavailable on ${method} — suppressing`, {
             code: classified.code,
             desc: classified.description,
             chatId,
           });
+          // Telegram sends chat_id as a number; normalize to string for the router map.
+          const chatIdStr = typeof chatId === "number" ? chatId.toString() : chatId;
+          if (typeof chatIdStr === "string" && chatIdStr !== "unknown") {
+            unbindDeadChat(chatIdStr).catch((err) => {
+              log.error("telegram", "unbindDeadChat failed", { chatId: chatIdStr, error: String(err) });
+            });
+          }
           return { ok: true, result: true } as any;
 
         case "rate_limit":
