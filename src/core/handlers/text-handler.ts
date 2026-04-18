@@ -174,9 +174,20 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
           log.info("send", "edit: final", { reqId, source: "final", chatId, messageId: streamMsgId, len: clean.length });
           await ctx.api.editMessageText(ctx.chat.id, streamMsgId, clean);
         } catch (err: any) {
-          log.warn("send", "final edit failed — falling back to sendResponse", { reqId, error: err?.description ?? String(err) });
-          log.info("send", "reply: sendResponse (fallback)", { reqId, source: "final-fallback", chatId, len: clean.length });
-          await sendResponse(ctx, clean, topicId);
+          const desc = (err?.description ?? String(err)).toLowerCase();
+          // Benign: the streamed message already shows this exact text (or was deleted).
+          // User already sees the correct response — don't duplicate it with a fallback send.
+          if (
+            desc.includes("message is not modified") ||
+            desc.includes("message to edit not found") ||
+            desc.includes("message can't be edited")
+          ) {
+            log.info("send", "final edit no-op (content unchanged or target gone)", { reqId, chatId, messageId: streamMsgId });
+          } else {
+            log.warn("send", "final edit failed — falling back to sendResponse", { reqId, error: err?.description ?? String(err) });
+            log.info("send", "reply: sendResponse (fallback)", { reqId, source: "final-fallback", chatId, len: clean.length });
+            await sendResponse(ctx, clean, topicId);
+          }
         }
       } else {
         if (streamMsgId) {
