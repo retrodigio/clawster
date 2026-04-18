@@ -442,6 +442,87 @@ export function startWebApi(options: WebApiOptions) {
       }));
     }
 
+    // POST /api/hooks/deliver — OpenClaw-compatible webhook delivery endpoint.
+    // Accepts payload: { message, name?, deliver?, channel: "telegram", to, topic_id?, agentId? }
+    // On `channel: "telegram"` → splits message and POSTs to Telegram Bot API.
+    // If `agentId` is present → fires the message at the agent runner (fire-and-forget).
+    if (path === "/api/hooks/deliver" && method === "POST") {
+      const body = await parseBody<{
+        message?: string;
+        name?: string;
+        deliver?: boolean;
+        channel?: string;
+        to?: string;
+        topic_id?: string | number;
+        agentId?: string;
+      }>(req);
+      if (!body) return withCors(err("Invalid JSON body"));
+      if (!body.message) return withCors(err("Missing 'message'"));
+      if (body.channel && body.channel !== "telegram") {
+        return withCors(err(`Unsupported channel '${body.channel}' (only 'telegram' is supported)`));
+      }
+      if (!body.to) return withCors(err("Missing 'to' (chat ID)"));
+
+      const cfg = currentConfig();
+      const botToken = cfg.config.botToken;
+      const topicId = body.topic_id ? Number(body.topic_id) : undefined;
+      const prefix = body.name ? `*${body.name}*\n` : "";
+      const fullMessage = prefix + body.message;
+
+      // Split into Telegram-sized chunks (hard limit 4096; use 4000 for safety margin)
+      const MAX = 4000;
+      const chunks: string[] = [];
+      for (let i = 0; i < fullMessage.length; i += MAX) {
+        chunks.push(fullMessage.slice(i, i + MAX));
+      }
+
+      let delivered = 0;
+      const errors: string[] = [];
+      for (const chunk of chunks) {
+        const payload: Record<string, unknown> = {
+          chat_id: body.to,
+          text: chunk,
+        };
+        if (topicId) payload.message_thread_id = topicId;
+        try {
+          const resp = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (resp.ok) {
+            delivered++;
+          } else {
+            errors.push(`HTTP ${resp.status}: ${await resp.text()}`);
+          }
+        } catch (e) {
+          errors.push(String(e));
+        }
+      }
+
+      // Optional agent-reactive mode — hand the message to an agent for triage/action
+      if (body.agentId) {
+        const agent = cfg.agentById.get(body.agentId);
+        if (agent) {
+          runner.run(agent, body.message, { topicId }).catch((e) =>
+            log.error("web-api", `Hook agent run failed: ${e}`, { agentId: body.agentId }),
+          );
+        } else {
+          log.warn("web-api", `Hook agentId '${body.agentId}' not found`);
+        }
+      }
+
+      log.info("web-api", `Hook delivered: ${delivered}/${chunks.length} chunks to ${body.to}`, {
+        source: body.name,
+        topicId,
+      });
+
+      if (errors.length > 0) {
+        return withCors(json({ ok: false, delivered, total: chunks.length, errors }, 502));
+      }
+      return withCors(json({ ok: true, delivered, total: chunks.length }));
+    }
+
     // GET /api/status — overall system status
     if (path === "/api/status" && method === "GET") {
       const cfg = currentConfig();
