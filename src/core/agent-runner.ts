@@ -235,7 +235,14 @@ export function createAgentRunner(options: {
       systemPrompt: {
         type: "preset",
         preset: "claude_code",
-        append: `You are ${agent.name}. Respond concisely — your output goes to Telegram.`,
+        append:
+          `You are ${agent.name}. Respond concisely — your output goes to Telegram.\n\n` +
+          `You can message other agents running in this Clawster orchestrator:\n` +
+          `  clawster msg <agentId> "message" --from=${agent.id}        # 1:1 send, fire-and-forget\n` +
+          `  clawster msg <agentId> "message" --from=${agent.id} --wait # 1:1 send, wait for reply\n` +
+          `  clawster msg --broadcast "message" --from=${agent.id}      # send to all agents (rate-limited: 1/30s)\n` +
+          `Use 'clawster agent list' to see agent IDs. Use broadcast sparingly.\n` +
+          `Messages sent to you from another agent are prefixed with "[from: <agentId>] ".`,
       },
     };
 
