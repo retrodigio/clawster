@@ -202,7 +202,21 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
     } catch (err) {
       log.error(agent.id, "Error handling message", { error: String(err) });
       await safeReact(ctx, "❌");
-      await safeSend(() => ctx.reply("Sorry, something went wrong processing your message."));
+      // Differentiate the user-facing message:
+      //   - Partial stream already shown + upstream stall → tell user it was cut off
+      //   - Stall with no partial → tell user upstream stalled
+      //   - Anything else → generic fallback
+      const errStr = String(err).toLowerCase();
+      const looksStalled =
+        errStr.includes("aborted by user") ||
+        errStr.includes("timed out") ||
+        errStr.includes("timeout");
+      const fallbackMsg = looksStalled && streamMsgId
+        ? "Heads up — my reply was cut off mid-stream (upstream stall). What I had so far is in the message above. Want me to retry?"
+        : looksStalled
+          ? "Upstream stalled before I could reply. Want me to retry?"
+          : "Sorry, something went wrong processing your message.";
+      await safeSend(() => ctx.reply(fallbackMsg));
     } finally {
       if (typingInterval) clearInterval(typingInterval);
     }
