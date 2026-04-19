@@ -26,6 +26,7 @@ import { agentCommand } from "./agent.ts";
 import { daemonCommand } from "./daemon.ts";
 import { workspaceCommand } from "./workspace.ts";
 import { migrateCommand } from "./migrate.ts";
+import { msgCommand } from "./msg.ts";
 
 program.addCommand(initCommand);
 program.addCommand(startCommand);
@@ -37,5 +38,6 @@ program.addCommand(agentCommand);
 program.addCommand(daemonCommand);
 program.addCommand(workspaceCommand);
 program.addCommand(migrateCommand);
+program.addCommand(msgCommand);
 
 program.parse();

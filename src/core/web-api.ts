@@ -102,6 +102,10 @@ export function startWebApi(options: WebApiOptions) {
   // Track active WebSocket connections per agent
   const activeWsConnections = new Map<string, Set<{ ws: any; close: () => void }>>();
 
+  // Inter-agent broadcast rate limit — one broadcast per `from` key per cooldown window.
+  const BROADCAST_COOLDOWN_MS = 30_000;
+  const lastBroadcastAt = new Map<string, number>();
+
   const server = Bun.serve({
     port,
     fetch(req, server) {
@@ -521,6 +525,116 @@ export function startWebApi(options: WebApiOptions) {
         return withCors(json({ ok: false, delivered, total: chunks.length, errors }, 502));
       }
       return withCors(json({ ok: true, delivered, total: chunks.length }));
+    }
+
+    // POST /api/agents/broadcast — inter-agent broadcast.
+    // Body: { message, from?, exclude?, excludeSelf? }
+    // - Prefixes message with `[from: {from}]` so receivers know who sent it.
+    // - Rate-limited per `from` (or "anon") to avoid spam: one broadcast / BROADCAST_COOLDOWN_MS.
+    // - Always fire-and-forget; returns 202 with the list of recipients.
+    if (path === "/api/agents/broadcast" && method === "POST") {
+      const body = await parseBody<{
+        message?: string;
+        from?: string;
+        exclude?: string[];
+        excludeSelf?: boolean;
+      }>(req);
+      if (!body) return withCors(err("Invalid JSON body"));
+      if (!body.message) return withCors(err("Missing 'message'"));
+
+      const fromKey = body.from || "anon";
+      const now = Date.now();
+      const last = lastBroadcastAt.get(fromKey) ?? 0;
+      if (now - last < BROADCAST_COOLDOWN_MS) {
+        const retryAfter = Math.ceil((BROADCAST_COOLDOWN_MS - (now - last)) / 1000);
+        return withCors(json(
+          { error: "Broadcast rate-limited", retryAfterSeconds: retryAfter },
+          429,
+        ));
+      }
+      lastBroadcastAt.set(fromKey, now);
+
+      const cfg = currentConfig();
+      const exclude = new Set(body.exclude ?? []);
+      if (body.excludeSelf !== false && body.from) exclude.add(body.from);
+
+      const prefix = body.from ? `[from: ${body.from}] ` : "[broadcast] ";
+      const promptText = prefix + body.message;
+
+      const delivered: string[] = [];
+      const skipped: string[] = [];
+      for (const agent of cfg.agents.agents) {
+        if (exclude.has(agent.id)) {
+          skipped.push(agent.id);
+          continue;
+        }
+        delivered.push(agent.id);
+        // Fire-and-forget — broadcasts must not block the caller.
+        runner.run(agent, promptText, { priority: "low" }).catch((e) =>
+          log.error("web-api", `Broadcast to ${agent.id} failed: ${e}`, {
+            from: body.from,
+          }),
+        );
+      }
+
+      log.info("web-api", `Broadcast delivered`, {
+        from: body.from,
+        count: delivered.length,
+        skipped: skipped.length,
+      });
+      return withCors(json({ ok: true, delivered, skipped }, 202));
+    }
+
+    // POST /api/agents/:id/message — 1:1 inter-agent (or external) message.
+    // Body: { message, from?, topicId?, wait? }
+    // - Prefixes message with `[from: {from}]` so the receiver sees the sender.
+    // - Default is fire-and-forget (returns 202). Pass `wait: true` to await the reply.
+    if (path.match(/^\/api\/agents\/[^/]+\/message$/) && method === "POST") {
+      const id = path.split("/api/agents/")[1]!.replace(/\/message$/, "");
+      const cfg = currentConfig();
+      const agent = cfg.agentById.get(id);
+      if (!agent) return withCors(err(`Agent '${id}' not found`, 404));
+
+      const body = await parseBody<{
+        message?: string;
+        from?: string;
+        topicId?: number;
+        wait?: boolean;
+      }>(req);
+      if (!body) return withCors(err("Invalid JSON body"));
+      if (!body.message) return withCors(err("Missing 'message'"));
+
+      // Reject self-addressed sends — they would livelock the per-agent mutex on wait:true.
+      if (body.from && body.from === id) {
+        return withCors(err("Agent cannot message itself"));
+      }
+
+      const prefix = body.from ? `[from: ${body.from}] ` : "";
+      const promptText = prefix + body.message;
+
+      if (body.wait) {
+        try {
+          const text = await runner.run(agent, promptText, {
+            topicId: body.topicId,
+            priority: "high",
+          });
+          log.info("web-api", `Sync message to ${id} completed`, { from: body.from });
+          return withCors(json({ ok: true, to: id, text }));
+        } catch (e) {
+          log.error("web-api", `Sync message to ${id} failed: ${e}`, { from: body.from });
+          return withCors(err(`Message failed: ${e}`, 500));
+        }
+      }
+
+      // Fire-and-forget — returns immediately.
+      runner.run(agent, promptText, {
+        topicId: body.topicId,
+        priority: "high",
+      }).catch((e) =>
+        log.error("web-api", `Async message to ${id} failed: ${e}`, { from: body.from }),
+      );
+      log.info("web-api", `Async message dispatched to ${id}`, { from: body.from });
+      return withCors(json({ ok: true, to: id, dispatched: true }, 202));
     }
 
     // GET /api/status — overall system status
