@@ -3,6 +3,7 @@ import type { MessageContext } from "../types.ts";
 import type { ActivityStatus } from "../agent-runner.ts";
 import { buildPrompt } from "../prompt-builder.ts";
 import { sendResponse } from "../message-sender.ts";
+import { toTelegramHtml, toTelegramHtmlPartial } from "../telegram-format.ts";
 import { parseIntents, processIntents } from "../intent-parser.ts";
 import { log } from "../logger.ts";
 import { registerTopic } from "../router.ts";
@@ -105,6 +106,12 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
           statusMsgId = undefined;
         }
 
+        // Render partial markdown → Telegram HTML. toTelegramHtmlPartial handles
+        // mid-span tokens gracefully (unclosed ** etc. stay literal; unterminated
+        // fenced code blocks render as partial <pre>). On parse error, fall back
+        // to plain text so the user still sees streamed content.
+        const html = toTelegramHtmlPartial(textSoFar);
+        const htmlOpts = { ...(replyOpts ?? {}), parse_mode: "HTML" as const };
         try {
           if (!streamMsgId) {
             // Race guard: only one concurrent caller creates the streaming message
@@ -112,7 +119,18 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
             streamMsgCreating = true;
             try {
               log.info("send", "reply: stream create", { reqId, source: "onUpdate", chatId, len: textSoFar.length });
-              const msg = await ctx.reply(textSoFar, replyOpts);
+              let msg;
+              try {
+                msg = await ctx.reply(html, htmlOpts);
+              } catch (htmlErr: any) {
+                const desc = (htmlErr?.description ?? String(htmlErr)).toLowerCase();
+                if (desc.includes("can't parse entities") || desc.includes("parse") || desc.includes("tag")) {
+                  log.warn("send", "HTML stream create failed — retrying as plain text", { reqId, error: htmlErr?.description ?? String(htmlErr) });
+                  msg = await ctx.reply(textSoFar, replyOpts);
+                } else {
+                  throw htmlErr;
+                }
+              }
               streamMsgId = msg?.message_id;
               log.info("send", "reply: stream created", { reqId, source: "onUpdate", chatId, messageId: streamMsgId, replyResultType: typeof msg });
             } finally {
@@ -120,7 +138,19 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
             }
           } else {
             log.info("send", "edit: stream update", { reqId, source: "onUpdate", chatId, messageId: streamMsgId, len: textSoFar.length });
-            await ctx.api.editMessageText(ctx.chat.id, streamMsgId, textSoFar);
+            try {
+              await ctx.api.editMessageText(ctx.chat.id, streamMsgId, html, { parse_mode: "HTML" });
+            } catch (htmlErr: any) {
+              const desc = (htmlErr?.description ?? String(htmlErr)).toLowerCase();
+              if (desc.includes("message is not modified")) {
+                // Benign — same HTML rendered for unchanged tail.
+              } else if (desc.includes("can't parse entities") || desc.includes("parse") || desc.includes("tag")) {
+                log.warn("send", "HTML stream edit failed — retrying as plain text", { reqId, error: htmlErr?.description ?? String(htmlErr) });
+                await ctx.api.editMessageText(ctx.chat.id, streamMsgId, textSoFar);
+              } else {
+                throw htmlErr;
+              }
+            }
           }
         } catch (err: any) {
           log.warn("send", "stream send/edit failed", { reqId, source: "onUpdate", error: err?.description ?? String(err) });
@@ -170,9 +200,14 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
       // Final delivery: update streaming message or send full response
       log.info("send", "final delivery entry", { reqId, chatId, hasStreamMsg: !!streamMsgId, streamMsgId, streamMsgCreating, cleanLen: clean.length });
       if (streamMsgId && clean.length <= 4000) {
+        // Stream updates are plain text (partial markdown can be mid-span);
+        // the final edit upgrades to Telegram HTML so the user sees proper
+        // formatting. If HTML rendering somehow produces invalid markup,
+        // retry as plain text before falling through to sendResponse.
+        const html = toTelegramHtml(clean);
         try {
           log.info("send", "edit: final", { reqId, source: "final", chatId, messageId: streamMsgId, len: clean.length });
-          await ctx.api.editMessageText(ctx.chat.id, streamMsgId, clean);
+          await ctx.api.editMessageText(ctx.chat.id, streamMsgId, html, { parse_mode: "HTML" });
         } catch (err: any) {
           const desc = (err?.description ?? String(err)).toLowerCase();
           // Benign: the streamed message already shows this exact text (or was deleted).
@@ -183,6 +218,16 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
             desc.includes("message can't be edited")
           ) {
             log.info("send", "final edit no-op (content unchanged or target gone)", { reqId, chatId, messageId: streamMsgId });
+          } else if (desc.includes("can't parse entities") || desc.includes("parse") || desc.includes("tag")) {
+            // Bad HTML — retry the same edit as plain text so the user still
+            // sees the final content (raw markdown is better than a generic error).
+            log.warn("send", "HTML final edit failed — retrying as plain text", { reqId, error: err?.description ?? String(err) });
+            try {
+              await ctx.api.editMessageText(ctx.chat.id, streamMsgId, clean);
+            } catch (plainErr: any) {
+              log.warn("send", "plain-text final edit also failed — falling back to sendResponse", { reqId, error: plainErr?.description ?? String(plainErr) });
+              await sendResponse(ctx, clean, topicId);
+            }
           } else {
             log.warn("send", "final edit failed — falling back to sendResponse", { reqId, error: err?.description ?? String(err) });
             log.info("send", "reply: sendResponse (fallback)", { reqId, source: "final-fallback", chatId, len: clean.length });
