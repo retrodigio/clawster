@@ -1,3 +1,6 @@
+import { toTelegramHtml } from "./telegram-format.ts";
+import { log } from "./logger.ts";
+
 const MAX_CHUNK = 4000;
 
 function splitMessage(text: string): string[] {
@@ -60,13 +63,32 @@ export async function sendResponse(
   response: string,
   topicId?: number,
 ): Promise<void> {
+  // Split on safe markdown boundaries (paragraph > line > space) BEFORE
+  // rendering. Each chunk is then rendered to Telegram HTML independently;
+  // since markdown spans don't cross paragraph boundaries in practice,
+  // per-chunk rendering stays well-formed without needing tag balancing.
   const chunks = splitMessage(response);
-  const replyOptions = topicId ? { message_thread_id: topicId } : undefined;
+  const baseOptions: Record<string, any> = topicId
+    ? { message_thread_id: topicId }
+    : {};
 
   for (let i = 0; i < chunks.length; i++) {
     if (i > 0) {
       await delay(100);
     }
-    await ctx.reply(chunks[i], replyOptions);
+    const markdown = chunks[i]!;
+    const html = toTelegramHtml(markdown);
+    try {
+      await ctx.reply(html, { ...baseOptions, parse_mode: "HTML" });
+    } catch (err: any) {
+      // Telegram rejects on any malformed HTML. Fall back to plain text so
+      // the user still sees the content (raw markdown is better than nothing).
+      const desc = err?.description ?? String(err);
+      log.warn("send", "HTML parse_mode failed — retrying as plain text", {
+        error: desc,
+        chunkIndex: i,
+      });
+      await ctx.reply(markdown, baseOptions);
+    }
   }
 }
