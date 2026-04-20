@@ -1,4 +1,5 @@
 import { join } from "path";
+import { run, type RunnerHandle } from "@grammyjs/runner";
 import { loadConfig, loadApiToken } from "./config.ts";
 import { initRouter, resolveAgent } from "./router.ts";
 import { createAgentRunner } from "./agent-runner.ts";
@@ -51,30 +52,38 @@ export async function startServer() {
     allowedUserId: config.allowedUserId,
   });
 
-  bot.start({
-    onStart: () => {
-      log.info("orchestrator", "Bot is running!");
-      webServer = startWebApi({
-        port: config.healthPort,
-        runner,
-        getConfig: () => loaded,
-        reloadConfig: async () => {
-          loaded = await loadConfig();
-          return loaded;
-        },
-        apiToken,
-      });
-      startScheduler(agents.agents, runner, config.botToken, config.timezone);
-    },
-  });
+  // Use @grammyjs/runner instead of bot.start() — the default sequentializes
+  // update handlers, which means a slow Claude subprocess for one agent blocks
+  // updates destined for every OTHER agent's chat. The runner dispatches each
+  // update concurrently so a long-running reply in chat A can't starve chat B.
+  // Concurrency of actual `claude -p` subprocesses remains bounded by the
+  // runner's internal priority-aware semaphore (maxConcurrent).
+  await bot.init();
+  log.info("orchestrator", "Bot is running!");
+  const botHandle: RunnerHandle = run(bot);
 
   let webServer: { stop(): void } | undefined;
+  webServer = startWebApi({
+    port: config.healthPort,
+    runner,
+    getConfig: () => loaded,
+    reloadConfig: async () => {
+      loaded = await loadConfig();
+      return loaded;
+    },
+    apiToken,
+  });
+  startScheduler(agents.agents, runner, config.botToken, config.timezone);
 
   const shutdown = async () => {
     log.info("orchestrator", "Shutting down gracefully...");
 
     // 1. Stop accepting new Telegram messages
-    bot.stop();
+    try {
+      await botHandle.stop();
+    } catch (err) {
+      log.warn("orchestrator", "Bot handle stop error (non-fatal)", { error: String(err) });
+    }
 
     // 2. Signal the runner to reject new queries
     runner.shutdown();
