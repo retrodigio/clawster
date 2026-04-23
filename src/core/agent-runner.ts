@@ -67,6 +67,24 @@ interface RunningQuery {
   query: Query;
   sessionId: string | null;
   agentKey: string;
+  /**
+   * Set when a subsequent message explicitly interrupts this query. Used by
+   * the caller's catch block to distinguish a "replaced by new message" abort
+   * (silent, expected) from a genuine failure or timeout.
+   */
+  interruptReason?: "new-message";
+}
+
+/**
+ * Error thrown when a streaming run was aborted because a newer user message
+ * interrupted it. Handlers should catch this specifically and stay silent —
+ * the new message is already being processed.
+ */
+export class InterruptedByNextMessageError extends Error {
+  constructor() {
+    super("Interrupted by subsequent message");
+    this.name = "InterruptedByNextMessageError";
+  }
 }
 
 /** Activity status reported during tool use / thinking phases. */
@@ -269,6 +287,11 @@ export function createAgentRunner(options: {
     log.info(running.agentKey, "Interrupting running query for new message", {
       sessionId: running.sessionId,
     });
+
+    // Tag the running query so its owning runStreaming loop can distinguish
+    // "replaced by new user message" from a real failure or timeout when the
+    // abort propagates through as a thrown error.
+    running.interruptReason = "new-message";
 
     try {
       await running.query.interrupt();
@@ -610,6 +633,14 @@ export function createAgentRunner(options: {
       priority?: QueryPriority;
       onActivity?: (status: ActivityStatus) => void;
       onEvent?: (event: ConversationEvent) => void;
+      /**
+       * What to do if the agent already has an in-flight query:
+       *   - "queue" (default): chain on the per-agent mutex; process FIFO
+       *     after the current turn finishes. Matches Claude Code's default.
+       *   - "interrupt": abort the in-flight query and start fresh now.
+       *     The prior caller's runStreaming will throw InterruptedByNextMessageError.
+       */
+      onBusy?: "interrupt" | "queue";
     },
   ): Promise<{ text: string; sessionId: string | null }> {
     if (isShuttingDown) {
@@ -619,8 +650,12 @@ export function createAgentRunner(options: {
     const maxTimeout = runOptions?.timeout ?? 1_800_000; // 30 min max
     const agentKey = getAgentKey(agent.id, runOptions?.topicId);
     const priority: QueryPriority = runOptions?.priority ?? "high";
+    const onBusy = runOptions?.onBusy ?? "queue";
 
-    const interruptedSessionId = await interruptIfRunning(agentKey);
+    // Only interrupt the in-flight query when the caller explicitly asks.
+    // Queue mode relies on the per-agent mutex below for FIFO serialization.
+    const interruptedSessionId =
+      onBusy === "interrupt" ? await interruptIfRunning(agentKey) : null;
 
     const prev = agentMutex.get(agentKey) ?? Promise.resolve();
     let releaseMutex: () => void;
@@ -809,8 +844,16 @@ export function createAgentRunner(options: {
           return { text: finalText.trim(), sessionId };
         } catch (err) {
           timer.clear();
+          // If this query was interrupted by a subsequent user message, throw
+          // a specific error so the caller can stay silent (the replacement
+          // handler is already running and will reply). Check the flag before
+          // clearing the map entry.
+          const wasInterruptedByNext = runningQuery.interruptReason === "new-message";
           activeQueries.delete(agentKey);
           outcome = "error";
+          if (wasInterruptedByNext) {
+            throw new InterruptedByNextMessageError();
+          }
           throw err;
         }
       } catch (err) {

@@ -31,6 +31,7 @@ type AgentRunner = {
       priority?: QueryPriority;
       onActivity?: (status: ActivityStatus) => void;
       onEvent?: (event: ConversationEvent) => void;
+      onBusy?: "interrupt" | "queue";
     },
   ) => Promise<{ text: string; sessionId: string | null }>;
 };
