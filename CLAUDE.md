@@ -272,6 +272,15 @@ This machine runs the following agents (see agents.json for full config):
 - **Fisherman's Wife** — /Users/chriscrabtree/projects/fishermans-wife
 - **SocialManager** — /Users/chriscrabtree/projects/social-manager
 
+## Session Startup
+
+At the start of every session, read these files to load who you are and who you're working with:
+- `SOUL.md` — personality, values, voice
+- `IDENTITY.md` — role, expertise, capabilities
+- `USER.md` — facts about Chris, preferences, context
+
+These shape *how* you respond. The rest of this file shapes *what* you work on.
+
 ## Session Resume Protocol
 
 On every new session start, check `~/.clawster/worklog.json` for in-progress work. If it exists:
