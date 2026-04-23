@@ -10,6 +10,7 @@ import {
 } from "../core/config.ts";
 import type { AgentsConfig } from "../core/config.ts";
 import type { AgentConfig } from "../core/types.ts";
+import { initializeWorkspace } from "./workspace.ts";
 
 function ask(question: string, defaultValue?: string): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -93,6 +94,36 @@ agentCommand
     agentsData.agents.push(agent);
     await saveAgents(agentsData);
     console.log(`\nAgent "${name}" (${id}) added.`);
+
+    // Auto-chain: scaffold the workspace so the new agent has a CLAUDE.md and
+    // soul files (SOUL/IDENTITY/USER) ready to go. Existing files are never
+    // clobbered, so this is safe to run against an existing workspace.
+    if (existsSync(workspace)) {
+      try {
+        const result = await initializeWorkspace({
+          workspacePath: workspace,
+          name,
+        });
+        if (result.claudeMd === "created") {
+          console.log(`Initialized CLAUDE.md at ${workspace}/CLAUDE.md`);
+        } else if (result.claudeMd === "skipped") {
+          console.log(`CLAUDE.md already present — left untouched.`);
+        }
+        if (result.soulFilesCreated.length > 0) {
+          console.log(
+            `Soul scaffolding: ${result.soulFilesCreated.join(", ")} (edit these to give ${name} a personality)`
+          );
+        }
+      } catch (err) {
+        console.warn(
+          `Workspace scaffolding skipped: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    } else {
+      console.warn(
+        `Workspace path "${workspace}" does not exist — skipping CLAUDE.md / soul scaffolding. Run 'clawster workspace init ${workspace} --name "${name}"' once you create it.`
+      );
+    }
   });
 
 // clawster agent list
