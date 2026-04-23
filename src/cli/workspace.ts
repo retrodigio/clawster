@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { readFile } from "fs/promises";
+import { readFile, copyFile } from "fs/promises";
 import { existsSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -137,15 +137,29 @@ export async function initializeWorkspace(opts: {
   workspacePath: string;
   name: string;
   merge?: boolean;
+  /**
+   * When true, only scaffold SOUL/IDENTITY/USER files — never touch CLAUDE.md.
+   * Safe to run against existing workspaces with customized CLAUDE.md content.
+   * Takes precedence over `merge` if both are set.
+   */
+  soulOnly?: boolean;
 }): Promise<{
   claudeMd: "created" | "merged" | "skipped";
   soulFilesCreated: string[];
   mergedFrom: string[];
+  /** Path to CLAUDE.md backup, if one was created during an overwrite. */
+  backupPath?: string;
 }> {
-  const { workspacePath, name, merge } = opts;
+  const { workspacePath, name, merge, soulOnly } = opts;
   const claudeMdPath = join(workspacePath, "CLAUDE.md");
 
   const soulFilesCreated = await scaffoldSoulFiles(workspacePath);
+
+  // `soulOnly` short-circuits all CLAUDE.md handling. Used to safely add soul
+  // scaffolding to existing workspaces without touching their CLAUDE.md.
+  if (soulOnly) {
+    return { claudeMd: "skipped", soulFilesCreated, mergedFrom: [] };
+  }
 
   if (existsSync(claudeMdPath) && !merge) {
     return { claudeMd: "skipped", soulFilesCreated, mergedFrom: [] };
@@ -166,6 +180,16 @@ export async function initializeWorkspace(opts: {
     }
   }
 
+  // Safety net: `--merge` regenerates CLAUDE.md from templates + source files,
+  // which destroys any custom content in an existing CLAUDE.md. Back it up
+  // before overwriting so users have a recovery path without digging into git.
+  let backupPath: string | undefined;
+  if (merge && existsSync(claudeMdPath)) {
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    backupPath = `${claudeMdPath}.bak.${ts}`;
+    await copyFile(claudeMdPath, backupPath);
+  }
+
   const claudeMd = buildClaudeMd(name, files);
   await Bun.write(claudeMdPath, claudeMd);
 
@@ -173,6 +197,7 @@ export async function initializeWorkspace(opts: {
     claudeMd: merge ? "merged" : "created",
     soulFilesCreated,
     mergedFrom,
+    backupPath,
   };
 }
 
@@ -184,22 +209,34 @@ workspaceCommand
   .command("init <path>")
   .description("Initialize a workspace with CLAUDE.md and soul scaffolding")
   .option("--name <name>", "Agent name for the CLAUDE.md header", "Agent")
-  .option("--merge", "Merge existing IDENTITY.md/SOUL.md files into CLAUDE.md")
-  .action(async (workspacePath: string, opts: { name: string; merge?: boolean }) => {
+  .option("--merge", "Rebuild CLAUDE.md from SOUL/IDENTITY/USER templates (backs up existing CLAUDE.md to CLAUDE.md.bak.<ts>)")
+  .option("--soul-only", "Only scaffold SOUL/IDENTITY/USER files — do not touch CLAUDE.md (safe for existing workspaces)")
+  .action(async (workspacePath: string, opts: { name: string; merge?: boolean; soulOnly?: boolean }) => {
+    if (opts.merge && opts.soulOnly) {
+      console.log("Both --merge and --soul-only given — using --soul-only (safer).");
+    }
+
     const result = await initializeWorkspace({
       workspacePath,
       name: opts.name,
       merge: opts.merge,
+      soulOnly: opts.soulOnly,
     });
 
-    if (result.claudeMd === "skipped") {
+    if (opts.soulOnly) {
+      console.log(`CLAUDE.md left untouched (--soul-only).`);
+    } else if (result.claudeMd === "skipped") {
       console.log(
-        `CLAUDE.md already exists at ${join(workspacePath, "CLAUDE.md")}. Use --merge to overwrite with merged content.`
+        `CLAUDE.md already exists at ${join(workspacePath, "CLAUDE.md")}. Use --soul-only to scaffold soul files without touching it, or --merge to rebuild it (backs up the existing file).`
       );
     } else if (result.claudeMd === "merged" && result.mergedFrom.length > 0) {
-      console.log(`CLAUDE.md created from: ${result.mergedFrom.join(", ")}`);
+      console.log(`CLAUDE.md rebuilt from: ${result.mergedFrom.join(", ")}`);
     } else {
       console.log(`CLAUDE.md template created at ${join(workspacePath, "CLAUDE.md")}`);
+    }
+
+    if (result.backupPath) {
+      console.log(`Existing CLAUDE.md backed up to: ${result.backupPath}`);
     }
 
     if (result.soulFilesCreated.length > 0) {
