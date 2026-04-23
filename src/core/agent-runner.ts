@@ -510,7 +510,7 @@ export function createAgentRunner(options: {
     if (isShuttingDown) {
       throw new Error("Runner is shutting down — not accepting new queries");
     }
-    const inactivityTimeout = (agent.inactivityTimeout ?? 180) * 1000; // Default 3 min inactivity
+    const inactivityTimeout = (agent.inactivityTimeout ?? 420) * 1000; // Default 7 min inactivity
     const maxTimeout = runOptions?.timeout ?? 1_800_000; // 30 min max
     const agentKey = getAgentKey(agent.id, runOptions?.topicId);
     const priority: QueryPriority = runOptions?.priority ?? "high";
@@ -646,7 +646,7 @@ export function createAgentRunner(options: {
     if (isShuttingDown) {
       throw new Error("Runner is shutting down — not accepting new queries");
     }
-    const inactivityTimeout = (agent.inactivityTimeout ?? 180) * 1000; // Default 3 min inactivity
+    const inactivityTimeout = (agent.inactivityTimeout ?? 420) * 1000; // Default 7 min inactivity
     const maxTimeout = runOptions?.timeout ?? 1_800_000; // 30 min max
     const agentKey = getAgentKey(agent.id, runOptions?.topicId);
     const priority: QueryPriority = runOptions?.priority ?? "high";
@@ -671,15 +671,27 @@ export function createAgentRunner(options: {
 
       const queryStart = Date.now();
       let outcome: "success" | "error" | "timeout" = "success";
+      const MAX_ATTEMPTS = 2; // one initial + one retry on inactivity timeout
       try {
+        // Retry loop: on mid-stream inactivity timeout, resume the saved session
+        // and try once more. Handles upstream API stalls where Claude goes silent
+        // for >inactivityTimeout mid-response. Other errors propagate normally.
+        for (let attemptNo = 1; attemptNo <= MAX_ATTEMPTS; attemptNo++) {
+        const isRetry = attemptNo > 1;
         const session = await getSession(agent.id, runOptions?.topicId);
-        const resumeSessionId = interruptedSessionId ?? session?.sessionId ?? null;
+        // First attempt: honor any interruptedSessionId. Retry: use whatever
+        // session got saved during the previous attempt's timeout.
+        const resumeSessionId = isRetry
+          ? (session?.sessionId ?? null)
+          : (interruptedSessionId ?? session?.sessionId ?? null);
 
         const opts = buildQueryOptions(agent, resumeSessionId);
 
         log.info(agent.id, "Starting SDK streaming query", {
           hasSession: !!resumeSessionId,
-          interrupted: !!interruptedSessionId,
+          interrupted: !!interruptedSessionId && !isRetry,
+          retry: isRetry,
+          attempt: attemptNo,
           inactivityTimeout,
           maxTimeout,
           priority,
@@ -812,7 +824,7 @@ export function createAgentRunner(options: {
           timer.clear();
 
           if (timer.timedOut) {
-            log.error(agent.id, "SDK streaming query timed out", { elapsed: timer.elapsed });
+            log.error(agent.id, "SDK streaming query timed out", { elapsed: timer.elapsed, attempt: attemptNo });
             if (sessionId) {
               await saveSession(agent.id, {
                 sessionId,
@@ -821,9 +833,16 @@ export function createAgentRunner(options: {
                 messageCount: session?.messageCount ?? 0,
               }, runOptions?.topicId);
             }
+            if (attemptNo < MAX_ATTEMPTS) {
+              log.warn(agent.id, "Inactivity timeout — retrying with resumed session", {
+                attempt: attemptNo,
+                elapsed: timer.elapsed,
+              });
+              continue;
+            }
             outcome = "timeout";
             return {
-              text: `The agent was working for ${timer.elapsed}s but became unresponsive. Session is saved — send another message to resume.`,
+              text: `The agent was working for ${timer.elapsed}s across ${attemptNo} attempts but became unresponsive. Session is saved — send another message to resume.`,
               sessionId,
             };
           }
@@ -856,6 +875,8 @@ export function createAgentRunner(options: {
           }
           throw err;
         }
+        } // end retry for-loop — unreachable: success/timeout both return above
+        throw new Error("runStreaming: retry loop exited without returning");
       } catch (err) {
         if (outcome === "success") outcome = "error";
         throw err;
