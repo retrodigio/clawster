@@ -1,10 +1,11 @@
 import type { Bot } from "grammy";
 import type { MessageContext } from "../types.ts";
-import type { ActivityStatus } from "../agent-runner.ts";
+import { InterruptedByNextMessageError, type ActivityStatus } from "../agent-runner.ts";
 import { buildPrompt } from "../prompt-builder.ts";
 import { sendResponse } from "../message-sender.ts";
 import { toTelegramHtml, toTelegramHtmlPartial } from "../telegram-format.ts";
 import { parseIntents, processIntents } from "../intent-parser.ts";
+import { classifyInflightIntent } from "../inflight-policy.ts";
 import { log } from "../logger.ts";
 import { registerTopic } from "../router.ts";
 import type { HandlerDeps } from "./types.ts";
@@ -181,7 +182,13 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
         }
       };
 
-      const { text: response } = await runner.runStreaming(agent, prompt, onUpdate, { topicId, onActivity });
+      // Classify whether this message should interrupt the current in-flight
+      // turn (if any) or queue FIFO behind it. Default bias is "queue" — matches
+      // Claude Code's interactive behavior.
+      const onBusy = classifyInflightIntent(ctx.message.text);
+      log.info("orchestrator", "In-flight policy decision", { reqId, chatId, agentId: agent.id, onBusy });
+
+      const { text: response } = await runner.runStreaming(agent, prompt, onUpdate, { topicId, onActivity, onBusy });
 
       const { clean, intents } = parseIntents(response);
 
@@ -245,6 +252,14 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
 
       await safeReact(ctx, "✅");
     } catch (err) {
+      // Interrupted by a subsequent user message — stay silent. The newer
+      // message is already being handled and will produce its own reply.
+      // Do not set ❌ or send a fallback; that would just confuse the user.
+      if (err instanceof InterruptedByNextMessageError) {
+        log.info(agent.id, "Query interrupted by newer message — suppressing fallback reply", { reqId });
+        return;
+      }
+
       log.error(agent.id, "Error handling message", { error: String(err) });
       await safeReact(ctx, "❌");
       // Differentiate the user-facing message:
