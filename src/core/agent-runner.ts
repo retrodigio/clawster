@@ -250,6 +250,15 @@ export function createAgentRunner(options: {
       allowDangerouslySkipPermissions: true,
       settingSources: ["project", "user"],
       includePartialMessages: true,
+      env: {
+        ...process.env,
+        // Enable persistent Tasks system (TaskCreate/TaskList/TaskGet/TaskUpdate).
+        // Per-agent task list ID lets every claude -p invocation for this agent
+        // share the same backlog across sessions and heartbeats.
+        // Storage: ~/.claude/tasks/clawster-<agentId>/<taskId>.json
+        CLAUDE_CODE_ENABLE_TASKS: "1",
+        CLAUDE_CODE_TASK_LIST_ID: `clawster-${agent.id}`,
+      },
       systemPrompt: {
         type: "preset",
         preset: "claude_code",
@@ -260,7 +269,14 @@ export function createAgentRunner(options: {
           `  clawster msg <agentId> "message" --from=${agent.id} --wait # 1:1 send, wait for reply\n` +
           `  clawster msg --broadcast "message" --from=${agent.id}      # send to all agents (rate-limited: 1/30s)\n` +
           `Use 'clawster agent list' to see agent IDs. Use broadcast sparingly.\n` +
-          `Messages sent to you from another agent are prefixed with "[from: <agentId>] ".`,
+          `Messages sent to you from another agent are prefixed with "[from: <agentId>] ".\n\n` +
+          `You have a persistent task backlog scoped to you (list ID: clawster-${agent.id}).\n` +
+          `Use TaskCreate / TaskList / TaskGet / TaskUpdate to track work that should\n` +
+          `survive across sessions and heartbeats. Tasks support dependencies via the\n` +
+          `'blocks' / 'blockedBy' fields, so you can queue follow-up work for your\n` +
+          `future self. Don't use it for ephemeral in-conversation todos — TodoWrite\n` +
+          `still covers that. Use Tasks for things that genuinely need to outlive this\n` +
+          `session (open bugs you noticed, planned features, deferred refactors).`,
       },
     };
 
