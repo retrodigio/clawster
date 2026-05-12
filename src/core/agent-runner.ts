@@ -526,10 +526,14 @@ export function createAgentRunner(options: {
     if (isShuttingDown) {
       throw new Error("Runner is shutting down — not accepting new queries");
     }
-    const inactivityTimeout = (agent.inactivityTimeout ?? 420) * 1000; // Default 7 min inactivity
-    const maxTimeout = runOptions?.timeout ?? 1_800_000; // 30 min max
     const agentKey = getAgentKey(agent.id, runOptions?.topicId);
     const priority: QueryPriority = runOptions?.priority ?? "high";
+    // High-priority (user-driven) queries get a longer inactivity window because
+    // deep sessions (hundreds of messages) can plausibly sit silent during
+    // cache-cold reasoning. Low-priority (heartbeat/scheduler) stays tighter.
+    const defaultInactivitySec = priority === "high" ? 600 : 420;
+    const inactivityTimeout = (agent.inactivityTimeout ?? defaultInactivitySec) * 1000;
+    const maxTimeout = runOptions?.timeout ?? 1_800_000; // 30 min max
 
     const prev = agentMutex.get(agentKey) ?? Promise.resolve();
     let releaseMutex: () => void;
@@ -662,10 +666,14 @@ export function createAgentRunner(options: {
     if (isShuttingDown) {
       throw new Error("Runner is shutting down — not accepting new queries");
     }
-    const inactivityTimeout = (agent.inactivityTimeout ?? 420) * 1000; // Default 7 min inactivity
-    const maxTimeout = runOptions?.timeout ?? 1_800_000; // 30 min max
     const agentKey = getAgentKey(agent.id, runOptions?.topicId);
     const priority: QueryPriority = runOptions?.priority ?? "high";
+    // High-priority (user-driven) queries get a longer inactivity window because
+    // deep sessions (hundreds of messages) can plausibly sit silent during
+    // cache-cold reasoning. Low-priority (heartbeat/scheduler) stays tighter.
+    const defaultInactivitySec = priority === "high" ? 600 : 420;
+    const inactivityTimeout = (agent.inactivityTimeout ?? defaultInactivitySec) * 1000;
+    const maxTimeout = runOptions?.timeout ?? 1_800_000; // 30 min max
     const onBusy = runOptions?.onBusy ?? "queue";
 
     // Only interrupt the in-flight query when the caller explicitly asks.
@@ -726,9 +734,12 @@ export function createAgentRunner(options: {
         };
         activeQueries.set(agentKey, runningQuery);
 
+        // Lifted out of the inner try so the catch block can see them and
+        // save the partial session state before retrying on inactivity abort.
+        let sessionId: string | null = resumeSessionId;
+        let accumulated = "";
+
         try {
-          let accumulated = "";
-          let sessionId: string | null = resumeSessionId;
           let resultText: string | null = null;
           let lastUpdateTime = 0;
           let lastActivityTime = 0;
@@ -885,10 +896,42 @@ export function createAgentRunner(options: {
           // clearing the map entry.
           const wasInterruptedByNext = runningQuery.interruptReason === "new-message";
           activeQueries.delete(agentKey);
-          outcome = "error";
           if (wasInterruptedByNext) {
+            outcome = "error";
             throw new InterruptedByNextMessageError();
           }
+          // The inactivity timer aborts the SDK by calling abortController.abort(),
+          // which causes the streaming `for await` above to throw rather than
+          // exit cleanly. Without this branch the retry-on-stall logic at the
+          // bottom of the success path is unreachable for the common case.
+          // Mirror that behavior here: save the session and retry once.
+          if (timer.timedOut) {
+            log.error(agent.id, "SDK streaming query aborted by inactivity timeout (caught from SDK)", {
+              elapsed: timer.elapsed,
+              attempt: attemptNo,
+            });
+            if (sessionId) {
+              await saveSession(agent.id, {
+                sessionId,
+                lastActivity: new Date().toISOString(),
+                lastHeartbeat: session?.lastHeartbeat ?? null,
+                messageCount: session?.messageCount ?? 0,
+              }, runOptions?.topicId);
+            }
+            if (attemptNo < MAX_ATTEMPTS) {
+              log.warn(agent.id, "Inactivity timeout — retrying with resumed session", {
+                attempt: attemptNo,
+                elapsed: timer.elapsed,
+              });
+              continue;
+            }
+            outcome = "timeout";
+            return {
+              text: `The agent was working for ${timer.elapsed}s across ${attemptNo} attempts but became unresponsive. Session is saved — send another message to resume.`,
+              sessionId,
+            };
+          }
+          outcome = "error";
           throw err;
         }
         } // end retry for-loop — unreachable: success/timeout both return above
