@@ -46,7 +46,7 @@
     "typescript": "^5.7.0"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.104",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.139",
     "@grammyjs/runner": "^2.0.3",
     "commander": "^14.0.3",
     "grammy": "^1.42.0",
