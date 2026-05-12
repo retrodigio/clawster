@@ -58,4 +58,39 @@ describe("buildPrompt", () => {
     expect(blocks).toHaveLength(3);
     expect(blocks[2]).toBe("body");
   });
+
+  test("hoists a /goal directive to the very top of the prompt", () => {
+    const prompt = buildPrompt(agent, "/goal tests pass", baseCtx, "America/Denver");
+    expect(prompt.startsWith("/goal tests pass")).toBe(true);
+    expect(prompt).toContain("Current time:");
+  });
+
+  test("keeps any follow-up text after the /goal line as the user message body", () => {
+    const prompt = buildPrompt(
+      agent,
+      "/goal CHANGELOG has an entry per merged PR\n\nStart with the api package.",
+      baseCtx,
+      "America/Denver",
+    );
+    const blocks = prompt.split("\n\n");
+    expect(blocks[0]).toBe("/goal CHANGELOG has an entry per merged PR");
+    expect(blocks[blocks.length - 1]).toBe("Start with the api package.");
+  });
+
+  test("does not match /goal in the middle of a message", () => {
+    const prompt = buildPrompt(agent, "Some context. /goal foo", baseCtx);
+    expect(prompt.startsWith("/goal")).toBe(false);
+    expect(prompt).toContain("Some context. /goal foo");
+  });
+
+  test("/goal hoisting precedes topic label and time header", () => {
+    const ctx: MessageContext = { ...baseCtx, topicId: 11, topicName: "Issues" };
+    const prompt = buildPrompt(agent, "/goal ship it", ctx);
+    const blocks = prompt.split("\n\n");
+    expect(blocks[0]).toBe("/goal ship it");
+    expect(blocks[1]).toBe("[Zero — Issues]");
+    expect(blocks[2]?.startsWith("Current time:")).toBe(true);
+    // No user body block after the goal — the message was nothing but the directive.
+    expect(blocks).toHaveLength(3);
+  });
 });
