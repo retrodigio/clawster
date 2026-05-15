@@ -199,21 +199,38 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
         });
       }
 
-      // Clean up status message if still showing
-      if (statusMsgId) {
-        await safeSend(() => ctx.api.deleteMessage(ctx.chat.id, statusMsgId!));
+      // Substitute placeholder when the agent produced no visible text. This
+      // happens on tool-call-only turns or when the response was nothing but
+      // intent tags ([REMEMBER:...], [GOAL:...], [DONE:...]) that parseIntents
+      // strips. Without this guard the empty `clean` flows into editMessageText
+      // / sendResponse, which Telegram rejects with "message text is empty",
+      // surfacing as a generic "something went wrong" to the user.
+      let finalText = clean;
+      if (!finalText.trim()) {
+        if (intents.length > 0) {
+          const labels: Record<string, string> = {
+            remember: "saved to memory",
+            goal: "goal noted",
+            done: "goal marked done",
+          };
+          const seen = Array.from(new Set(intents.map((i) => i.type)));
+          finalText = `_(${seen.map((t) => labels[t] ?? t).join(", ")})_`;
+        } else {
+          finalText = "_(no visible output — tool-call-only turn)_";
+        }
+        log.info("send", "empty response — substituted placeholder", { reqId, intentTypes: intents.map((i) => i.type), placeholder: finalText });
       }
 
       // Final delivery: update streaming message or send full response
-      log.info("send", "final delivery entry", { reqId, chatId, hasStreamMsg: !!streamMsgId, streamMsgId, streamMsgCreating, cleanLen: clean.length });
-      if (streamMsgId && clean.length <= 4000) {
+      log.info("send", "final delivery entry", { reqId, chatId, hasStreamMsg: !!streamMsgId, streamMsgId, streamMsgCreating, cleanLen: finalText.length });
+      if (streamMsgId && finalText.length <= 4000) {
         // Stream updates are plain text (partial markdown can be mid-span);
         // the final edit upgrades to Telegram HTML so the user sees proper
         // formatting. If HTML rendering somehow produces invalid markup,
         // retry as plain text before falling through to sendResponse.
-        const html = toTelegramHtml(clean);
+        const html = toTelegramHtml(finalText);
         try {
-          log.info("send", "edit: final", { reqId, source: "final", chatId, messageId: streamMsgId, len: clean.length });
+          log.info("send", "edit: final", { reqId, source: "final", chatId, messageId: streamMsgId, len: finalText.length });
           await ctx.api.editMessageText(ctx.chat.id, streamMsgId, html, { parse_mode: "HTML" });
         } catch (err: any) {
           const desc = (err?.description ?? String(err)).toLowerCase();
@@ -230,15 +247,15 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
             // sees the final content (raw markdown is better than a generic error).
             log.warn("send", "HTML final edit failed — retrying as plain text", { reqId, error: err?.description ?? String(err) });
             try {
-              await ctx.api.editMessageText(ctx.chat.id, streamMsgId, clean);
+              await ctx.api.editMessageText(ctx.chat.id, streamMsgId, finalText);
             } catch (plainErr: any) {
               log.warn("send", "plain-text final edit also failed — falling back to sendResponse", { reqId, error: plainErr?.description ?? String(plainErr) });
-              await sendResponse(ctx, clean, topicId);
+              await sendResponse(ctx, finalText, topicId);
             }
           } else {
             log.warn("send", "final edit failed — falling back to sendResponse", { reqId, error: err?.description ?? String(err) });
-            log.info("send", "reply: sendResponse (fallback)", { reqId, source: "final-fallback", chatId, len: clean.length });
-            await sendResponse(ctx, clean, topicId);
+            log.info("send", "reply: sendResponse (fallback)", { reqId, source: "final-fallback", chatId, len: finalText.length });
+            await sendResponse(ctx, finalText, topicId);
           }
         }
       } else {
@@ -246,8 +263,8 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
           log.info("send", "delete: stream msg (too long for edit)", { reqId, chatId, messageId: streamMsgId });
           await safeSend(() => ctx.api.deleteMessage(ctx.chat.id, streamMsgId!));
         }
-        log.info("send", "reply: sendResponse", { reqId, source: "final-send", chatId, len: clean.length });
-        await sendResponse(ctx, clean, topicId);
+        log.info("send", "reply: sendResponse", { reqId, source: "final-send", chatId, len: finalText.length });
+        await sendResponse(ctx, finalText, topicId);
       }
 
       await safeReact(ctx, "✅");
