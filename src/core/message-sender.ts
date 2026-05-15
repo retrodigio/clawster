@@ -63,6 +63,16 @@ export async function sendResponse(
   response: string,
   topicId?: number,
 ): Promise<void> {
+  // Defensive: Telegram rejects sendMessage/editMessageText with empty `text`
+  // ("Bad Request: message text is empty"). Substitute a placeholder so callers
+  // that hand us an empty string (intent-stripped responses, tool-call-only
+  // turns) still produce a visible reply instead of cascading into a generic
+  // "something went wrong" error.
+  if (!response || !response.trim()) {
+    log.warn("send", "sendResponse called with empty text — substituting placeholder", { topicId });
+    response = "(no visible output from agent)";
+  }
+
   // Split on safe markdown boundaries (paragraph > line > space) BEFORE
   // rendering. Each chunk is then rendered to Telegram HTML independently;
   // since markdown spans don't cross paragraph boundaries in practice,
