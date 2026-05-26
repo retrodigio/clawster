@@ -52,6 +52,9 @@ export const AgentSchema = z.object({
   tasks: z.array(TaskSchema).optional(),
   inactivityTimeout: z.number().optional(),
   extraArgs: z.record(z.string(), z.nullable(z.string())).optional(),
+  // Per-agent allowlist for MCP servers marked `restricted: true` in
+  // config/mcp-servers.json. See AgentConfig.mcpServers for rationale.
+  mcpServers: z.array(z.string()).optional(),
 });
 
 export const AgentsConfigSchema = z.object({

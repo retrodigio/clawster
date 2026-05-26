@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "open-brain": {
+      "type": "sse",
+      "url": "http://localhost:3577/mcp"
+    },
+    "playwright": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@latest",
+        "--cdp-endpoint=http://localhost:9222"
+      ],
+      "restricted": true
+    }
+  }
+}

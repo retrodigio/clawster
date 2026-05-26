@@ -37,6 +37,7 @@ src/
     logs.ts               # clawster logs
     agent.ts              # clawster agent add|list|remove|discover
     workspace.ts          # clawster workspace init
+    browser.ts            # clawster browser init|status|chrome
     daemon.ts             # clawster daemon install|uninstall
     migrate.ts            # clawster migrate (from OpenClaw)
   core/
@@ -58,7 +59,7 @@ src/
   daemon/                 # launchd integration
 config/
   agents.json             # Agent definitions (development/reference copy)
-  mcp-open-brain.json     # MCP server config for Open Brain
+  mcp-servers.json        # MCP server registry (open-brain + restricted servers like playwright)
 daemon/
   *.plist                 # launchd plist files
   install-daemon.ts       # Daemon installer
@@ -87,6 +88,9 @@ templates/                # Templates for new workspace CLAUDE.md files
 | `clawster daemon install` | Install launchd daemon for auto-start |
 | `clawster daemon uninstall` | Remove launchd daemon |
 | `clawster migrate` | Migrate from OpenClaw format |
+| `clawster browser init` | Walk through Chrome + Playwright-MCP setup |
+| `clawster browser status` | Check whether Chrome is reachable on CDP port 9222 |
+| `clawster browser chrome` | Print the Chrome launch command (for copy/paste) |
 
 ## Config Structure
 
@@ -156,6 +160,7 @@ Agent fields:
 - `heartbeat.activeHours` — Optional window: `{ "start": "08:00", "end": "22:00" }`
 - `heartbeat.target` — Always `"telegram"` for now
 - `heartbeat.to` — Chat ID to send heartbeat messages to
+- `mcpServers` — Per-agent allowlist of restricted MCP servers (see Browser MCP below)
 
 ## Adding a New Agent
 
@@ -207,7 +212,7 @@ Agents with a `heartbeat` config proactively check in on their project. The hear
 
 ## Open Brain Memory Integration
 
-Open Brain is a shared semantic memory system running as an MCP server on localhost:3577. All agents connect to it via `config/mcp-open-brain.json`.
+Open Brain is a shared semantic memory system running as an MCP server on localhost:3577. All agents connect to it via `config/mcp-servers.json` (the `open-brain` entry).
 
 Usage from within an agent session:
 - `ob search "query"` — Search memory semantically
@@ -215,6 +220,33 @@ Usage from within an agent session:
 - `ob recent` — Browse recent entries
 
 When you (the Clawster agent) learn something important about a project or Chris's preferences, save it to Open Brain so other agents can benefit.
+
+## MCP Server Registry + Per-Agent ACL
+
+All MCP servers live in `config/mcp-servers.json`. Each entry may carry an optional `restricted: true` flag.
+
+- **Non-restricted servers** (e.g. `open-brain`) are attached to every agent automatically.
+- **Restricted servers** are only attached to agents that explicitly opt-in via `agents.json` → `mcpServers: ["server-name"]`.
+
+Today the only restricted server is `playwright`, because the browser it drives can be authenticated. Granting an agent `playwright` means that agent can navigate, click, and screenshot any site you're logged into on the attached Chrome — so grant it deliberately, not fleet-wide.
+
+### Browser MCP (Playwright)
+
+The `playwright` MCP attaches over the Chrome DevTools Protocol to your locally running Chrome at `http://localhost:9222`. This mirrors OpenClaw's `existing-session` driver: zero re-login, no 2FA dance, no anti-bot risk — it's literally your Chrome.
+
+**One-time setup:**
+
+```bash
+clawster browser init       # walks you through launching Chrome with --remote-debugging-port=9222
+clawster browser status     # checks whether the CDP endpoint is up
+clawster browser chrome     # prints just the launch command for copy/paste
+```
+
+**Granting an agent access:**
+
+Add `"mcpServers": ["playwright"]` to its entry in `agents.json`. Today only `main` (Zero) has this.
+
+**Security trade-off:** the attached Chrome inherits *every* site you're logged into. Keep `mcpServers: ["playwright"]` narrow. Family agents (Bugs' Bot, Aust' Bot) must never get it.
 
 ## Conventions
 
