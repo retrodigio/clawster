@@ -27,6 +27,7 @@ import { daemonCommand } from "./daemon.ts";
 import { workspaceCommand } from "./workspace.ts";
 import { migrateCommand } from "./migrate.ts";
 import { msgCommand } from "./msg.ts";
+import { browserCommand } from "./browser.ts";
 
 program.addCommand(initCommand);
 program.addCommand(startCommand);
@@ -39,5 +40,6 @@ program.addCommand(daemonCommand);
 program.addCommand(workspaceCommand);
 program.addCommand(migrateCommand);
 program.addCommand(msgCommand);
+program.addCommand(browserCommand);
 
 program.parse();

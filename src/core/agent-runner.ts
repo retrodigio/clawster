@@ -219,8 +219,13 @@ export function createAgentRunner(options: {
   const agentMutex = new Map<string, Promise<void>>();
   const activeQueries = new Map<string, RunningQuery>();
 
-  // Load MCP config once at startup
+  // Load MCP config once at startup. Each server entry may carry an optional
+  // `restricted: true` flag indicating it's only available to agents that
+  // opt-in via agents.json `mcpServers`. We strip that flag here before
+  // handing configs to the SDK (which doesn't know the field) and remember
+  // the restricted set so buildQueryOptions can filter per-agent.
   let mcpServers: Record<string, any> | undefined;
+  const restrictedServers = new Set<string>();
   if (mcpConfigPath) {
     try {
       const raw = JSON.parse(
@@ -229,9 +234,14 @@ export function createAgentRunner(options: {
       if (raw.mcpServers) {
         mcpServers = {};
         for (const [name, config] of Object.entries(raw.mcpServers as Record<string, any>)) {
-          mcpServers[name] = config;
+          const { restricted, ...sdkConfig } = config ?? {};
+          if (restricted === true) restrictedServers.add(name);
+          mcpServers[name] = sdkConfig;
         }
-        log.info("runner", "Loaded MCP config", { servers: Object.keys(mcpServers) });
+        log.info("runner", "Loaded MCP config", {
+          servers: Object.keys(mcpServers),
+          restricted: Array.from(restrictedServers),
+        });
       }
     } catch {
       log.warn("runner", "Could not load MCP config", { path: mcpConfigPath });
@@ -258,6 +268,10 @@ export function createAgentRunner(options: {
         // Storage: ~/.claude/tasks/clawster-<agentId>/<taskId>.json
         CLAUDE_CODE_ENABLE_TASKS: "1",
         CLAUDE_CODE_TASK_LIST_ID: `clawster-${agent.id}`,
+        // SDK 0.3.x changed MCP connections to non-blocking by default. Restore
+        // pre-0.3 blocking behavior so Open Brain is ready before turn 1 — agents
+        // call `ob search` / `ob capture` reflexively and a turn-1 miss is a regression.
+        MCP_CONNECTION_NONBLOCKING: "0",
       },
       systemPrompt: {
         type: "preset",
@@ -286,7 +300,19 @@ export function createAgentRunner(options: {
     }
 
     if (mcpServers) {
-      opts.mcpServers = mcpServers;
+      // Per-agent MCP ACL: include every non-restricted server unconditionally,
+      // and only include restricted servers that this agent explicitly listed
+      // in agents.json `mcpServers`. Empty/undefined agent allowlist = no
+      // restricted servers granted. See types.ts AgentConfig.mcpServers for
+      // the rationale (e.g. Playwright drives an authenticated browser and
+      // shouldn't be available fleet-wide).
+      const agentAllowlist = new Set(agent.mcpServers ?? []);
+      const filtered: Record<string, any> = {};
+      for (const [name, config] of Object.entries(mcpServers)) {
+        if (restrictedServers.has(name) && !agentAllowlist.has(name)) continue;
+        filtered[name] = config;
+      }
+      opts.mcpServers = filtered;
     }
 
     if (agent.extraArgs) {

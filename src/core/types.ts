@@ -29,6 +29,14 @@ export interface AgentConfig {
   tasks?: TaskConfig[];
   inactivityTimeout?: number; // Per-agent inactivity timeout in seconds (default: 180)
   extraArgs?: Record<string, string | null>; // Extra CLI args passed to Claude Code (null = boolean flag, string = value flag)
+  /**
+   * Per-agent allowlist for MCP servers marked `restricted: true` in the
+   * global MCP config. Non-restricted servers (e.g. Open Brain) are available
+   * to every agent regardless. Restricted servers (e.g. Playwright, which
+   * drives a logged-in browser) only attach to agents that explicitly list
+   * them here. Undefined or empty array = no restricted servers granted.
+   */
+  mcpServers?: string[];
 }
 
 export interface OrchestratorConfig {

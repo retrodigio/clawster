@@ -134,6 +134,25 @@ describe("AgentSchema", () => {
     });
     expect(parsed.tasks).toHaveLength(1);
   });
+
+  test("accepts an mcpServers allowlist", () => {
+    const parsed = AgentSchema.parse({ ...base, mcpServers: ["playwright"] });
+    expect(parsed.mcpServers).toEqual(["playwright"]);
+  });
+
+  test("accepts an empty mcpServers allowlist", () => {
+    const parsed = AgentSchema.parse({ ...base, mcpServers: [] });
+    expect(parsed.mcpServers).toEqual([]);
+  });
+
+  test("mcpServers is optional", () => {
+    const parsed = AgentSchema.parse(base);
+    expect(parsed.mcpServers).toBeUndefined();
+  });
+
+  test("rejects non-string mcpServers entries", () => {
+    expect(() => AgentSchema.parse({ ...base, mcpServers: [123 as unknown as string] })).toThrow();
+  });
 });
 
 describe("AgentsConfigSchema", () => {

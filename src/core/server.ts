@@ -25,8 +25,10 @@ export async function startServer() {
   const resolveAgentFn = (chatId: string, isPrivate: boolean) =>
     resolveAgent(chatId, isPrivate);
 
-  // MCP config for Open Brain shared memory
-  const mcpConfigPath = join(import.meta.dir, "..", "..", "config", "mcp-open-brain.json");
+  // MCP config — global server registry. Entries marked `restricted: true`
+  // are only granted to agents that opt-in via agents.json `mcpServers`; all
+  // other entries (e.g. Open Brain) are available to every agent.
+  const mcpConfigPath = join(import.meta.dir, "..", "..", "config", "mcp-servers.json");
 
   const runner = createAgentRunner({
     maxConcurrent: config.maxConcurrent,
