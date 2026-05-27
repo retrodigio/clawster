@@ -20,6 +20,36 @@ export const startCommand = new Command("start")
     if (platform() === "darwin") {
       if (existsSync(PLIST_PATH)) {
         const uid = process.getuid?.() ?? 501;
+
+        // Check whether the service is currently loaded. `launchctl print`
+        // exits non-zero when the label is unknown to launchd (e.g. after
+        // `clawster stop` did a bootout). In that case kickstart would fail —
+        // we need to bootstrap first.
+        const probe = Bun.spawn(
+          ["launchctl", "print", `gui/${uid}/${LABEL}`],
+          { stdout: "ignore", stderr: "ignore" },
+        );
+        await probe.exited;
+        const loaded = probe.exitCode === 0;
+
+        if (!loaded) {
+          // Re-register the service with launchd. RunAtLoad=true *should* trigger
+          // an automatic start, but in practice — especially right after a prior
+          // bootout — launchd leaves it in `pended nondemand spawn = speculative`
+          // without actually spawning. We always kickstart below to force it.
+          const bootstrap = Bun.spawn(
+            ["launchctl", "bootstrap", `gui/${uid}`, PLIST_PATH],
+            { stdout: "inherit", stderr: "inherit" },
+          );
+          await bootstrap.exited;
+          if (bootstrap.exitCode !== 0) {
+            console.error(
+              `Bootstrap failed (exit ${bootstrap.exitCode}). Check: launchctl print gui/${uid}/${LABEL}`,
+            );
+            return;
+          }
+        }
+
         const proc = Bun.spawn(["launchctl", "kickstart", `gui/${uid}/${LABEL}`], {
           stdout: "inherit",
           stderr: "inherit",

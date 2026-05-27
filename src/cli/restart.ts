@@ -8,29 +8,39 @@ const LABEL = "com.clawster.daemon";
 const SYSTEMD_SERVICE = "clawster.service";
 
 export const restartCommand = new Command("restart")
-  .description("Gracefully stop and restart Clawster (preserves sessions, reloads plist/unit)")
+  .description("Restart Clawster atomically (preserves sessions; for plist changes, use 'clawster daemon install')")
   .action(async () => {
     if (platform() === "darwin" && existsSync(PLIST_PATH)) {
       const uid = process.getuid?.() ?? 501;
-      // bootout + bootstrap reloads the plist (picks up EnvironmentVariables changes).
-      // kickstart -k would restart the process but keep the stale loaded config.
-      console.log("Restarting via launchctl bootout + bootstrap (reloads plist)...");
-      const bootout = Bun.spawn(
-        ["launchctl", "bootout", `gui/${uid}`, PLIST_PATH],
-        { stdout: "inherit", stderr: "inherit" },
-      );
-      await bootout.exited;
-      // bootout returns non-zero if the service wasn't loaded; that's fine.
+
+      // Ensure the service is loaded. If `clawster stop` was run earlier the
+      // service may be unloaded, in which case bootstrap puts it back into
+      // launchd's registry (and RunAtLoad=true starts it). If already loaded,
+      // bootstrap exits non-zero, which is fine — kickstart below handles it.
       const bootstrap = Bun.spawn(
         ["launchctl", "bootstrap", `gui/${uid}`, PLIST_PATH],
-        { stdout: "inherit", stderr: "inherit" },
+        { stdout: "ignore", stderr: "ignore" },
       );
       await bootstrap.exited;
-      if (bootstrap.exitCode === 0) {
+
+      // kickstart -k is one atomic signal to launchd: kill the running process
+      // and respawn it. Critically, this survives the caller dying mid-flight
+      // — `clawster restart` is often invoked from inside the daemon (Telegram
+      // → Zero agent), so a two-step bootout+bootstrap dance leaves the
+      // service unloaded if the caller is killed between commands.
+      // Tradeoff: kickstart does NOT pick up plist changes (env vars, args).
+      // To reload the plist, run `clawster daemon install` again.
+      console.log("Restarting via launchctl kickstart -k...");
+      const kick = Bun.spawn(
+        ["launchctl", "kickstart", "-k", `gui/${uid}/${LABEL}`],
+        { stdout: "inherit", stderr: "inherit" },
+      );
+      await kick.exited;
+      if (kick.exitCode === 0) {
         console.log("Clawster restarted. Sessions resume from ~/.clawster/sessions/.");
       } else {
         console.error(
-          `Restart failed (bootstrap exit ${bootstrap.exitCode}). Check: launchctl print gui/${uid}/${LABEL}`,
+          `Restart failed (kickstart exit ${kick.exitCode}). Check: launchctl print gui/${uid}/${LABEL}`,
         );
       }
       return;
