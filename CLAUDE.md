@@ -228,25 +228,37 @@ All MCP servers live in `config/mcp-servers.json`. Each entry may carry an optio
 - **Non-restricted servers** (e.g. `open-brain`) are attached to every agent automatically.
 - **Restricted servers** are only attached to agents that explicitly opt-in via `agents.json` → `mcpServers: ["server-name"]`.
 
-Today the only restricted server is `playwright`, because the browser it drives can be authenticated. Granting an agent `playwright` means that agent can navigate, click, and screenshot any site you're logged into on the attached Chrome — so grant it deliberately, not fleet-wide.
+Today the only restricted server is `playwright`, because the dedicated debug Chrome it drives accumulates authenticated logins. Granting an agent `playwright` means that agent can navigate, click, and screenshot any site you've logged into in the debug profile — so grant it deliberately, not fleet-wide.
 
 ### Browser MCP (Playwright)
 
-The `playwright` MCP attaches over the Chrome DevTools Protocol to your locally running Chrome at `http://localhost:9222`. This mirrors OpenClaw's `existing-session` driver: zero re-login, no 2FA dance, no anti-bot risk — it's literally your Chrome.
+The `playwright` MCP attaches over the Chrome DevTools Protocol to a **dedicated debug Chrome** with its own user-data-dir at `~/.clawster/chrome-debug-profile/`. This matches OpenClaw's default driver pattern (Playwright + persistent profile), not its `existing-session` mode.
+
+Why dedicated and not your daily Chrome:
+- `open -a "Google Chrome" --args --remote-debugging-port=9222` silently drops the flag when any Chrome process is already running (helper processes, profile pickers, etc.). A separate user-data-dir forces a brand-new process tree that always honors the flag.
+- Smaller blast radius. Only the sites you log into in the debug profile are reachable by agents — banking, work email, etc. in your daily Chrome stay untouched.
+- No conflict with your daily browsing. Agent automations don't grab focus from your tabs.
 
 **One-time setup:**
 
 ```bash
-clawster browser init       # walks you through launching Chrome with --remote-debugging-port=9222
-clawster browser status     # checks whether the CDP endpoint is up
-clawster browser chrome     # prints just the launch command for copy/paste
+clawster browser init       # launches dedicated debug Chrome, waits for CDP endpoint
+clawster browser status     # checks whether the debug Chrome is up
+clawster browser chrome     # prints the Chrome launch command (for copy/paste)
 ```
+
+After `init`, log into the sites you want agents to reach (facebook.com/marketplace, ksl.com/classifieds, etc.) in the new Chrome window. Cookies persist in the debug profile; future runs skip the login dance.
+
+**Environment overrides:**
+- `CLAWSTER_BROWSER_PROFILE` — override the debug-profile path (default `~/.clawster/chrome-debug-profile`).
+- `CLAWSTER_CHROME_BIN` — override the Chrome binary path (defaults to `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` on macOS, `/usr/bin/google-chrome` on Linux).
+- `CLAWSTER_BROWSER_AUTOLAUNCH=0` — disable auto-launch; print the command instead.
 
 **Granting an agent access:**
 
 Add `"mcpServers": ["playwright"]` to its entry in `agents.json`. Today only `main` (Zero) has this.
 
-**Security trade-off:** the attached Chrome inherits *every* site you're logged into. Keep `mcpServers: ["playwright"]` narrow. Family agents (Bugs' Bot, Aust' Bot) must never get it.
+**Security trade-off:** the debug Chrome inherits any site you log into *in that profile*. Keep `mcpServers: ["playwright"]` narrow. Family agents (Bugs' Bot, Aust' Bot) must never get it. Also: the CDP port (9222) has no auth — any process on localhost can connect. Acceptable for a single-user Mac; revisit if untrusted local code ever runs on this box.
 
 ## Conventions
 
