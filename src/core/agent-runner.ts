@@ -1,7 +1,7 @@
 import { query, type Query, type Options } from "@anthropic-ai/claude-agent-sdk";
 import { log } from "./logger.ts";
 import type { AgentConfig } from "./types.ts";
-import { getSession, saveSession } from "./session-store.ts";
+import { getSession, saveSession, clearSession } from "./session-store.ts";
 import {
   messagesTotal,
   queryDurationSeconds,
@@ -254,7 +254,7 @@ export function createAgentRunner(options: {
 
   function buildQueryOptions(agent: AgentConfig, resumeSessionId: string | null): Options {
     const opts: Options = {
-      model: "claude-opus-4-7",
+      model: "claude-opus-4-8",
       cwd: agent.workspace,
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
@@ -956,6 +956,24 @@ export function createAgentRunner(options: {
               text: `The agent was working for ${timer.elapsed}s across ${attemptNo} attempts but became unresponsive. Session is saved — send another message to resume.`,
               sessionId,
             };
+          }
+          // Self-heal stale sessions: Claude Code ages saved conversations out
+          // of its store, after which every resume of that ID fails identically
+          // and the agent/topic is bricked until someone clears the file by hand.
+          // Clear the dead pointer and retry once — the next pass reads a null
+          // session and starts fresh, so the user gets a real reply on attempt 1.
+          const errMsg = err instanceof Error ? err.message : String(err);
+          if (
+            /No conversation found with session ID/i.test(errMsg) &&
+            resumeSessionId &&
+            attemptNo < MAX_ATTEMPTS
+          ) {
+            log.warn(agent.id, "Stale session — clearing and retrying fresh", {
+              staleSessionId: resumeSessionId.slice(0, 12),
+              attempt: attemptNo,
+            });
+            await clearSession(agent.id, runOptions?.topicId);
+            continue;
           }
           outcome = "error";
           throw err;
