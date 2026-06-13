@@ -1,6 +1,7 @@
 import { join } from "path";
 import { run, type RunnerHandle } from "@grammyjs/runner";
-import { loadConfig, loadApiToken } from "./config.ts";
+import { loadApiToken } from "./config.ts";
+import { initConfigStore, getConfig, reloadConfigStore, onConfigChange } from "./config-store.ts";
 import { initRouter, resolveAgent } from "./router.ts";
 import { createAgentRunner } from "./agent-runner.ts";
 import { createBot } from "./bot.ts";
@@ -16,11 +17,26 @@ export async function startServer() {
     process.exit(1);
   }
 
-  const { config, agents, chatIdToAgent, agentById, defaultAgent } = await loadConfig();
+  const { config, agents, chatIdToAgent, agentById, defaultAgent } = await initConfigStore();
   const apiToken = await loadApiToken();
 
   const unboundChatIds = new Set<string>(agents.unboundChatIds);
   initRouter(chatIdToAgent, defaultAgent, unboundChatIds, agents);
+
+  // Keep the router in sync with config changes (web API edits, discovery,
+  // topic registration). Without this, routing and heartbeats ran on the
+  // startup snapshot until the next restart.
+  onConfigChange((cfg) => {
+    initRouter(
+      cfg.chatIdToAgent,
+      cfg.defaultAgent,
+      new Set(cfg.agents.unboundChatIds),
+      cfg.agents,
+    );
+    log.info("orchestrator", "Config reloaded — router re-initialized", {
+      agents: cfg.agentById.size,
+    });
+  });
 
   const resolveAgentFn = (chatId: string, isPrivate: boolean) =>
     resolveAgent(chatId, isPrivate);
@@ -44,9 +60,6 @@ export async function startServer() {
     agentById,
   });
 
-  // Mutable config reference for web API
-  let loaded = { config, agents, chatIdToAgent, agentById, defaultAgent };
-
   const maskedToken = config.botToken.slice(0, 6) + "..." + config.botToken.slice(-4);
   log.info("orchestrator", "Starting orchestrator", {
     agents: agentById.size,
@@ -68,14 +81,13 @@ export async function startServer() {
   webServer = startWebApi({
     port: config.healthPort,
     runner,
-    getConfig: () => loaded,
-    reloadConfig: async () => {
-      loaded = await loadConfig();
-      return loaded;
-    },
+    getConfig,
+    reloadConfig: reloadConfigStore,
     apiToken,
   });
-  startScheduler(agents.agents, runner, config.botToken, config.timezone);
+  // The scheduler reads agents through the store on every tick, so heartbeat
+  // and task changes take effect without a restart.
+  startScheduler(() => getConfig().agents.agents, runner, config.botToken, config.timezone);
 
   let shuttingDown = false;
   const shutdown = async () => {

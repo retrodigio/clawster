@@ -2,7 +2,7 @@ import { readdirSync, statSync, existsSync } from "fs";
 import { join, basename } from "path";
 import { homedir } from "os";
 import { log } from "./logger.ts";
-import { saveAgents } from "./config.ts";
+import { mutateAgents } from "./config-store.ts";
 import type { AgentsConfig } from "./config.ts";
 import type { AgentConfig } from "./types.ts";
 
@@ -102,10 +102,11 @@ export async function createAgentFromMatch(
     telegramChatId: chatId,
   };
 
-  agentsConfig.agents.push(agent);
-  await saveAgents(agentsConfig);
+  await mutateAgents((agents) => {
+    agents.agents.push(agent);
+  });
 
-  // Update in-memory routing
+  // Update in-memory routing immediately (the store reload also re-inits the router)
   chatIdToAgent.set(chatId, agent);
 
   log.info("discovery", "Auto-created agent from project match", {
@@ -170,8 +171,9 @@ You have access to Open Brain — a shared semantic memory system across all pro
     telegramChatId: chatId,
   };
 
-  agentsConfig.agents.push(agent);
-  await saveAgents(agentsConfig);
+  await mutateAgents((agents) => {
+    agents.agents.push(agent);
+  });
   chatIdToAgent.set(chatId, agent);
 
   log.info("discovery", "Created new project and agent", {

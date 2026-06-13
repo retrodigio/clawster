@@ -110,24 +110,29 @@ function resolveAgentTasks(agent: AgentConfig, timezone: string): TaskConfig[] {
   return [];
 }
 
-export function startScheduler(agents: AgentConfig[], runner: Runner, botToken: string, timezone: string): void {
+export function startScheduler(
+  getAgents: () => AgentConfig[],
+  runner: Runner,
+  botToken: string,
+  timezone: string,
+): void {
   const lastRun = new Map<string, number>();
 
-  const allTasks: { agent: AgentConfig; task: TaskConfig }[] = [];
-  for (const agent of agents) {
-    const tasks = resolveAgentTasks(agent, timezone);
-    for (const task of tasks) {
-      allTasks.push({ agent, task });
+  // Tasks are re-derived from the config store on every tick (cheap at fleet
+  // scale) so agent/heartbeat edits apply without a restart.
+  function buildTasks(): { agent: AgentConfig; task: TaskConfig }[] {
+    const allTasks: { agent: AgentConfig; task: TaskConfig }[] = [];
+    for (const agent of getAgents()) {
+      for (const task of resolveAgentTasks(agent, timezone)) {
+        allTasks.push({ agent, task });
+      }
     }
+    return allTasks;
   }
 
-  if (allTasks.length === 0) {
-    log.info("scheduler", "No agents with tasks or heartbeats — scheduler idle");
-    return;
-  }
-
-  // Log what we're scheduling
-  for (const { agent, task } of allTasks) {
+  // Log what we're scheduling at startup
+  const initialTasks = buildTasks();
+  for (const { agent, task } of initialTasks) {
     const next = getNextMatch(task.schedule, getTimeInZone(timezone));
     const nextStr = next.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true });
     log.info("scheduler", `Scheduled task ${agent.id}:${task.name}`, {
@@ -137,10 +142,11 @@ export function startScheduler(agents: AgentConfig[], runner: Runner, botToken: 
     });
   }
 
-  log.info("scheduler", `Scheduler started with ${allTasks.length} task(s) across ${agents.length} agent(s)`);
+  log.info("scheduler", `Scheduler started with ${initialTasks.length} task(s)`);
 
   // Check every 60 seconds
   setInterval(() => {
+    const allTasks = buildTasks();
     const now = getTimeInZone(timezone);
     const currentMinuteKey = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}-${now.getHours()}-${now.getMinutes()}`;
 

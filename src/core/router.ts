@@ -1,6 +1,6 @@
 import type { AgentConfig } from "./types.ts";
 import { log } from "./logger.ts";
-import { saveAgents } from "./config.ts";
+import { mutateAgents } from "./config-store.ts";
 import type { AgentsConfig } from "./config.ts";
 
 let chatIdToAgent: Map<string, AgentConfig>;
@@ -57,21 +57,22 @@ export async function unbindDeadChat(chatId: string): Promise<boolean> {
     agent.heartbeat = undefined;
   }
 
-  // Mirror the change into the persisted config and save.
-  const persisted = agentsConfig.agents.find((a) => a.id === agent.id);
-  if (persisted) {
-    if (persisted.telegramChatId === chatId) {
-      persisted.telegramChatId = "";
-    }
-    if (persisted.heartbeat?.to === chatId) {
-      persisted.heartbeat = undefined;
-    }
-    try {
-      await saveAgents(agentsConfig);
-    } catch (err) {
-      log.error("router", "Failed to persist unbind", { agentId: agent.id, chatId, error: String(err) });
-      // Runtime is already unbound — return true anyway so we stop retrying.
-    }
+  // Mirror the change into the persisted config (serialized + validated +
+  // atomic via the config store; the reload it triggers re-inits this router).
+  try {
+    await mutateAgents((agents) => {
+      const persisted = agents.agents.find((a) => a.id === agent.id);
+      if (!persisted) return;
+      if (persisted.telegramChatId === chatId) {
+        persisted.telegramChatId = "";
+      }
+      if (persisted.heartbeat?.to === chatId) {
+        delete persisted.heartbeat;
+      }
+    });
+  } catch (err) {
+    log.error("router", "Failed to persist unbind", { agentId: agent.id, chatId, error: String(err) });
+    // Runtime is already unbound — return true anyway so we stop retrying.
   }
 
   log.warn("router", "Unbound dead chat from agent", {
@@ -97,13 +98,13 @@ export async function registerTopic(agent: AgentConfig, topicId: number, topicNa
 
   agent.topics[topicId.toString()] = { name: topicName };
 
-  // Update the persisted config
-  const persisted = agentsConfig.agents.find((a) => a.id === agent.id);
-  if (persisted) {
+  // Update the persisted config through the store (serialized + validated).
+  await mutateAgents((agents) => {
+    const persisted = agents.agents.find((a) => a.id === agent.id);
+    if (!persisted) return;
     if (!persisted.topics) persisted.topics = {};
     persisted.topics[topicId.toString()] = { name: topicName };
-    await saveAgents(agentsConfig);
-  }
+  });
 
   log.info("router", "Auto-registered topic", {
     agentId: agent.id,
