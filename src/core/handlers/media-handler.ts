@@ -8,7 +8,7 @@ import { registerTopic, getRouterState } from "../router.ts";
 import { transcribe } from "../transcribe.ts";
 import { findMatchingProject, createAgentFromMatch } from "../discovery.ts";
 import { writeFile, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { tmpdir } from "node:os";
 import type { HandlerDeps } from "./types.ts";
 import { safeSend, safeReact, resolveTopicName } from "./shared.ts";
@@ -231,7 +231,10 @@ export function registerMediaHandlers(bot: Bot, deps: HandlerDeps): void {
       }
 
       const buffer = Buffer.from(await response.arrayBuffer());
-      tempPath = join(tmpdir(), `tg-doc-${Date.now()}-${originalName}`);
+      // Sender-controlled filename: strip any path components so "../../x" can't
+      // escape tmpdir, and drop shell-hostile characters.
+      const safeName = basename(originalName).replace(/[^\w.\-]/g, "_");
+      tempPath = join(tmpdir(), `tg-doc-${Date.now()}-${safeName}`);
       await writeFile(tempPath, buffer);
 
       log.info("orchestrator", "Document received", { chatId, agentId: agent.id, filename: originalName, mimeType, size: buffer.length });

@@ -1,6 +1,6 @@
 import { homedir } from "os";
 import { join } from "path";
-import { readFile, mkdir } from "fs/promises";
+import { readFile, writeFile, mkdir, chmod, rename } from "fs/promises";
 import { existsSync } from "fs";
 import { z } from "zod";
 import { log } from "./logger.ts";
@@ -224,12 +224,17 @@ export async function saveConfig(config: ClawsterConfig): Promise<void> {
 export async function loadApiToken(): Promise<string> {
   const home = getClawsterHome();
   await mkdir(home, { recursive: true });
+  // The token grants agent execution — keep the directory and file owner-only.
+  await chmod(home, 0o700).catch(() => {});
   const tokenPath = join(home, "api-token");
   try {
     const token = await readFile(tokenPath, "utf-8");
-    if (token.trim()) return token.trim();
+    if (token.trim()) {
+      await chmod(tokenPath, 0o600).catch(() => {});
+      return token.trim();
+    }
   } catch { /* file doesn't exist yet */ }
   const token = crypto.randomUUID();
-  await Bun.write(tokenPath, token);
+  await writeFile(tokenPath, token, { mode: 0o600 });
   return token;
 }
