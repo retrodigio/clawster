@@ -1,33 +1,30 @@
 import { Command } from "commander";
 import { existsSync } from "fs";
-import { homedir } from "os";
 import { join } from "path";
 import { getClawsterHome } from "../core/config.ts";
 
-function findLogFile(): string | null {
-  const candidates = [
-    join(getClawsterHome(), "logs", "clawster.log"),
-    join(homedir(), "Library", "Logs", "clawster.log"),
-  ];
-  for (const p of candidates) {
-    if (existsSync(p)) return p;
-  }
-  return null;
+function logPath(error: boolean): string {
+  const name = error ? "clawster.error.log" : "clawster.log";
+  return join(getClawsterHome(), "logs", name);
 }
 
 export const logsCommand = new Command("logs")
   .description("View Clawster logs")
   .option("-f, --follow", "Follow log output (tail -f)")
-  .action(async (opts: { follow?: boolean }) => {
-    const logFile = findLogFile();
-    if (!logFile) {
-      console.error("No log file found. Checked:");
-      console.error(`  ${join(getClawsterHome(), "logs", "clawster.log")}`);
-      console.error(`  ${join(homedir(), "Library", "Logs", "clawster.log")}`);
+  .option("-e, --error", "Show the error log (startup crashes land here, not in the main log)")
+  .option("-n, --lines <count>", "Number of lines to show", "50")
+  .action(async (opts: { follow?: boolean; error?: boolean; lines?: string }) => {
+    const logFile = logPath(Boolean(opts.error));
+    if (!existsSync(logFile)) {
+      console.error(`No log file found at ${logFile}`);
+      if (!opts.error && existsSync(logPath(true))) {
+        console.error("An error log exists — try 'clawster logs --error'.");
+      }
       process.exit(1);
     }
 
-    const args = opts.follow ? ["-f", logFile] : ["-50", logFile];
+    const count = parseInt(opts.lines ?? "50", 10) || 50;
+    const args = opts.follow ? ["-f", logFile] : [`-${count}`, logFile];
     const proc = Bun.spawn(["tail", ...args], {
       stdout: "inherit",
       stderr: "inherit",

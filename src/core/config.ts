@@ -10,10 +10,69 @@ export function getClawsterHome(): string {
   return process.env.CLAWSTER_HOME || join(homedir(), ".clawster");
 }
 
+// --- Secrets env file (~/.clawster/env) ---
+//
+// Durable home for secrets (CLAWSTER_BOT_TOKEN, CLAWSTER_GROQ_KEY, ...) so they
+// survive plist regeneration by `clawster daemon install`. Plain KEY=VALUE
+// lines, written 0600. Real environment variables always take precedence.
+
+export function getEnvFilePath(): string {
+  return join(getClawsterHome(), "env");
+}
+
+/** Parse ~/.clawster/env into a map. Returns {} when the file doesn't exist. */
+export async function readEnvFile(): Promise<Record<string, string>> {
+  let content: string;
+  try {
+    content = await readFile(getEnvFilePath(), "utf-8");
+  } catch {
+    return {};
+  }
+  const out: Record<string, string> = {};
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    // Allow optionally quoted values
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+/** Apply the env file to process.env without overriding real environment variables. */
+export async function applyEnvFile(): Promise<void> {
+  const vars = await readEnvFile();
+  for (const [key, value] of Object.entries(vars)) {
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+}
+
+/** Add or update a single entry in ~/.clawster/env (created 0600). */
+export async function saveEnvVar(key: string, value: string): Promise<void> {
+  const home = getClawsterHome();
+  await mkdir(home, { recursive: true });
+  const existing = await readEnvFile();
+  existing[key] = value;
+  const lines = [
+    "# Clawster secrets — loaded by the orchestrator and merged into the daemon",
+    "# config by `clawster daemon install`. Keep this file private (0600).",
+    ...Object.entries(existing).map(([k, v]) => `${k}=${v}`),
+    "",
+  ];
+  await writeFile(getEnvFilePath(), lines.join("\n"), { mode: 0o600 });
+  await chmod(getEnvFilePath(), 0o600).catch(() => {});
+}
+
 // --- Zod Schemas ---
 
 export const ClawsterConfigSchema = z.object({
-  botToken: z.string().min(1, "Bot token is required"),
+  botToken: z.string().min(1, "Bot token is required — set CLAWSTER_BOT_TOKEN in the environment or add CLAWSTER_BOT_TOKEN=... to ~/.clawster/env"),
   allowedUserId: z.string().min(1, "Allowed user ID is required"),
   timezone: z.string().default(Intl.DateTimeFormat().resolvedOptions().timeZone),
   claudePath: z.string().default("claude"),
@@ -128,6 +187,9 @@ export interface LoadedConfig {
 export async function loadConfig(): Promise<LoadedConfig> {
   const home = getClawsterHome();
 
+  // Secrets live in ~/.clawster/env (real env vars still win)
+  await applyEnvFile();
+
   // Load config.json
   const configPath = join(home, "config.json");
   let rawConfig: Record<string, unknown> = {};
@@ -153,7 +215,9 @@ export async function loadConfig(): Promise<LoadedConfig> {
   if (process.env.CLAWSTER_USER_ID) rawConfig.allowedUserId = process.env.CLAWSTER_USER_ID;
   if (process.env.CLAWSTER_TIMEZONE) rawConfig.timezone = process.env.CLAWSTER_TIMEZONE;
 
-  // Validate config with Zod
+  // Validate config with Zod. Default a missing token to "" so the failure
+  // surfaces the actionable min(1) message instead of a bare type error.
+  if (rawConfig.botToken === undefined) rawConfig.botToken = "";
   let config: ClawsterConfig;
   try {
     config = ClawsterConfigSchema.parse(rawConfig) as ClawsterConfig;
