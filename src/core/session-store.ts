@@ -8,15 +8,17 @@ function getSessionsDir(): string {
   return join(getClawsterHome(), "sessions");
 }
 
-export function getSessionKey(agentId: string, topicId?: number): string {
-  if (topicId !== undefined) {
-    return `${agentId}-topic-${topicId}`;
-  }
-  return agentId;
+export function getSessionKey(agentId: string, topicId?: number, scope?: string): string {
+  let key = agentId;
+  if (topicId !== undefined) key += `-topic-${topicId}`;
+  // Scope gives scheduled runs (heartbeats) their own session so they don't
+  // advance the user's conversation pointer into a fork of heartbeat noise.
+  if (scope) key += `-${scope}`;
+  return key;
 }
 
-function sessionPath(agentId: string, topicId?: number): string {
-  return join(getSessionsDir(), `${getSessionKey(agentId, topicId)}.json`);
+function sessionPath(agentId: string, topicId?: number, scope?: string): string {
+  return join(getSessionsDir(), `${getSessionKey(agentId, topicId, scope)}.json`);
 }
 
 function defaultSession(): AgentSession {
@@ -36,8 +38,8 @@ function tryParseSession(data: string): AgentSession | null {
   }
 }
 
-export async function getSession(agentId: string, topicId?: number): Promise<AgentSession> {
-  const filePath = sessionPath(agentId, topicId);
+export async function getSession(agentId: string, topicId?: number, scope?: string): Promise<AgentSession> {
+  const filePath = sessionPath(agentId, topicId, scope);
   const tmpPath = `${filePath}.tmp`;
 
   // Try the main session file first
@@ -66,9 +68,9 @@ export async function getSession(agentId: string, topicId?: number): Promise<Age
   return defaultSession();
 }
 
-export async function saveSession(agentId: string, session: AgentSession, topicId?: number): Promise<void> {
+export async function saveSession(agentId: string, session: AgentSession, topicId?: number, scope?: string): Promise<void> {
   await mkdir(getSessionsDir(), { recursive: true });
-  const filePath = sessionPath(agentId, topicId);
+  const filePath = sessionPath(agentId, topicId, scope);
   const tmpPath = `${filePath}.tmp`;
   // Write to temp file first, then atomic rename
   await Bun.write(tmpPath, JSON.stringify(session, null, 2));
@@ -105,10 +107,19 @@ export async function getAllSessions(): Promise<Map<string, AgentSession>> {
   return sessions;
 }
 
-export async function clearSession(agentId: string, topicId?: number): Promise<void> {
+export async function clearSession(agentId: string, topicId?: number, scope?: string): Promise<void> {
+  const filePath = sessionPath(agentId, topicId, scope);
   try {
-    await unlink(sessionPath(agentId, topicId));
+    await unlink(filePath);
   } catch {
     // File doesn't exist — nothing to clear
+  }
+  // Also remove the .tmp recovery file — getSession falls back to it, so a
+  // leftover .tmp would resurrect the exact session a clear (or the
+  // stale-session self-heal) just tried to kill.
+  try {
+    await unlink(`${filePath}.tmp`);
+  } catch {
+    // No recovery file — fine
   }
 }

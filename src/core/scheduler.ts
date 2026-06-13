@@ -6,7 +6,7 @@ type Runner = {
   run(
     agent: AgentConfig,
     prompt: string,
-    opts?: { timeout?: number; priority?: "high" | "low" },
+    opts?: { timeout?: number; priority?: "high" | "low"; sessionScope?: string },
   ): Promise<string>;
 };
 
@@ -78,14 +78,20 @@ function heartbeatToCron(every: string, activeHours?: { start: string; end: stri
 }
 
 async function sendTelegram(botToken: string, chatId: string, text: string, topicId?: number): Promise<boolean> {
-  const body: Record<string, unknown> = { chat_id: chatId, text };
-  if (topicId) body.message_thread_id = topicId;
-  const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return response.ok;
+  // Telegram hard limit is 4096 chars/message — chunk long check-ins instead
+  // of letting the whole send fail.
+  const MAX = 4000;
+  for (let i = 0; i < text.length; i += MAX) {
+    const body: Record<string, unknown> = { chat_id: chatId, text: text.slice(i, i + MAX) };
+    if (topicId) body.message_thread_id = topicId;
+    const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) return false;
+  }
+  return true;
 }
 
 /** Resolve the effective task list for an agent, converting legacy heartbeat config if needed. */
@@ -174,11 +180,28 @@ export function startScheduler(
       // Fire and forget — don't block the tick loop
       (async () => {
         try {
-          const response = await runner.run(agent, task.prompt, { timeout: 120_000, priority: "low" });
+          // 10-minute ceiling: heartbeat prompts ask the agent to review git
+          // and project state, which legitimately takes minutes on a cold
+          // cache. The old 2-minute ceiling produced timeout messages that
+          // then got SENT as check-ins.
+          // sessionScope keeps scheduled runs in their own session so they
+          // never advance the user's conversation pointer.
+          const response = await runner.run(agent, task.prompt, {
+            timeout: 600_000,
+            priority: "low",
+            sessionScope: "scheduled",
+          });
           const trimmed = response.trim();
 
           if (trimmed === "NO_CHECKIN" || trimmed.startsWith("NO_CHECKIN") || trimmed === "") {
             log.info("scheduler", `Task ${taskKey}: no output to send`);
+            return;
+          }
+
+          // Runner timeout text is a failure report, not agent output — never
+          // deliver it as a check-in.
+          if (/became unresponsive\. Session is saved/i.test(trimmed)) {
+            log.warn("scheduler", `Task ${taskKey}: run timed out — suppressing check-in`);
             return;
           }
 

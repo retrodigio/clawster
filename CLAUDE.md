@@ -41,29 +41,30 @@ src/
     daemon.ts             # clawster daemon install|uninstall
     migrate.ts            # clawster migrate (from OpenClaw)
   core/
-    agent-runner.ts       # Spawns claude -p with concurrency control
+    activity-timeout.ts   # Tool-aware inactivity/max timeout state machine
+    agent-runner.ts       # Spawns Claude SDK queries with concurrency control
     bot.ts                # grammY bot setup and message routing
-    config.ts             # Config loading from ~/.clawster/
-    health.ts             # Health check endpoint
-    heartbeat.ts          # Proactive agent check-ins
+    config.ts             # Config loading from ~/.clawster/ (incl. secrets env file)
+    config-store.ts       # Single source of truth for runtime config + change events
     intent-parser.ts      # Message intent classification
     lock.ts               # PID lock file management
     logger.ts             # Structured JSON logging
     message-sender.ts     # Telegram message sending with chunking
-    prompt-builder.ts     # Prompt assembly for claude -p
+    message-wal.ts        # Inbound-message write-ahead log (restart loss detection)
+    prompt-builder.ts     # Prompt assembly for agent queries
     router.ts             # Chat ID -> agent resolution
-    server.ts             # Main entry point (starts bot + heartbeats)
+    scheduler.ts          # Heartbeats and cron-scheduled tasks
+    semaphore.ts          # Priority-aware concurrency semaphore
+    server.ts             # Main entry point (starts bot + scheduler + web API)
     session-store.ts      # Session ID persistence per agent+topic
     transcribe.ts         # Voice message transcription (Groq)
     types.ts              # TypeScript interfaces
-  daemon/                 # launchd integration
+    web-api.ts            # Local HTTP API + dashboard backend (loopback only)
 config/
   agents.json             # Agent definitions (development/reference copy)
   mcp-servers.json        # MCP server registry (open-brain + restricted servers like playwright)
 daemon/
-  *.plist                 # launchd plist files
-  install-daemon.ts       # Daemon installer
-  uninstall-daemon.ts     # Daemon uninstaller
+  com.claude.open-brain.plist  # launchd plist for the Open Brain MCP server
 scripts/
   discover-chats.ts       # Chat ID discovery helper
   migrate-workspaces.ts   # Migration from OpenClaw workspace files
@@ -77,9 +78,11 @@ templates/                # Templates for new workspace CLAUDE.md files
 |---|---|
 | `clawster init` | First-time setup: bot token, user ID, timezone, creates ~/.clawster/ |
 | `clawster start` | Start the orchestrator (bot + heartbeats) |
-| `clawster stop` | Stop the running orchestrator |
-| `clawster status` | Check health of running instance |
-| `clawster logs` | View orchestrator logs |
+| `clawster stop` | Stop the running orchestrator (waits for in-flight work to drain) |
+| `clawster restart` | Restart the daemon atomically (launchctl kickstart) |
+| `clawster status` | Check health of running instance (shows error-log tail when down) |
+| `clawster logs` | View orchestrator logs (`--error` for the error log, `-f` to follow) |
+| `clawster msg <agentId> "text"` | Send a message to another agent (`--broadcast` for all) |
 | `clawster agent add <name>` | Add a new agent interactively |
 | `clawster agent list` | List all configured agents |
 | `clawster agent remove <name>` | Remove an agent |
@@ -100,15 +103,28 @@ All config lives at `~/.clawster/` (or `$CLAWSTER_HOME`).
 
 ```json
 {
-  "botToken": "123456:ABC...",
   "allowedUserId": "992115973",
   "timezone": "America/Denver",
   "claudePath": "claude",
   "healthPort": 18800,
-  "maxConcurrent": 4,
-  "groqKey": ""
+  "maxConcurrent": 4
 }
 ```
+
+### ~/.clawster/env (secrets)
+
+Secrets never live in config.json — `saveConfig` strips them on every write.
+They live in `~/.clawster/env` (mode 0600), plain `KEY=VALUE` lines:
+
+```
+CLAWSTER_BOT_TOKEN=123456:ABC...
+CLAWSTER_GROQ_KEY=gsk_...
+```
+
+`loadConfig()` reads this file (real environment variables win on conflict),
+and `clawster daemon install` merges its entries — plus any vars already in the
+installed plist — into the daemon's `EnvironmentVariables`, so regenerating the
+plist never drops the bot token.
 
 Environment variable overrides: `CLAWSTER_BOT_TOKEN`, `CLAWSTER_USER_ID`, `CLAWSTER_TIMEZONE`, `CLAWSTER_GROQ_KEY`.
 
@@ -189,7 +205,8 @@ Add an entry to the `agents` array in `~/.clawster/agents.json`:
 }
 ```
 
-Then restart: `clawster stop && clawster start`.
+Then restart: `clawster restart`. (Agent edits made through the web API or by
+the running orchestrator itself hot-reload — no restart needed.)
 
 ### Finding the Telegram chat ID
 
@@ -268,8 +285,8 @@ Add `"mcpServers": ["playwright"]` to its entry in `agents.json`. Today only `ma
 - **Minimal dependencies** — grammY and commander are the only runtime deps
 - **Structured JSON logging** — All log output is JSON to stdout (launchd captures to files)
 - **Concurrency** — Global semaphore + per-agent mutex. Never run two claude processes for the same agent simultaneously.
-- **Sessions** — Persisted at `~/.clawster/sessions/<agentId>.json` (or `<agentId>_topic_<topicId>.json`)
-- **PID lock** — `~/.clawster/orchestrator.lock` prevents duplicate instances
+- **Sessions** — Persisted at `~/.clawster/sessions/<agentId>.json` (topics: `<agentId>-topic-<topicId>.json`; scheduled runs: `<agentId>-scheduled.json` so heartbeats never advance the user's conversation)
+- **PID lock** — `~/.clawster/clawster.lock` prevents duplicate instances
 
 ## Operations
 
@@ -296,10 +313,10 @@ Log rotation is the **operator's responsibility** and must be handled by the OS:
 The macOS `newsyslog.conf` syntax used by the install script is:
 ```
 # logfilename              [owner:group]  mode count size  when  flags
-/Users/YOU/.clawster/logs/clawster.log       644  5    10240 *   JG
-/Users/YOU/.clawster/logs/clawster.error.log 644  5    10240 *   JG
+/Users/YOU/.clawster/logs/clawster.log       644  5    10240 *   ZN
+/Users/YOU/.clawster/logs/clawster.error.log 644  5    10240 *   ZN
 ```
-Flags: `J` = compress with bzip2 (use `Z` for gzip), `G` = signal a group. Size is in KB, so `10240` = 10 MB. `*` in the `when` column means size-only trigger.
+Flags: `Z` = compress with gzip, `N` = don't signal any process (launchd keeps the descriptor; copytruncate-style behavior). Size is in KB, so `10240` = 10 MB. `*` in the `when` column means size-only trigger.
 
 ## Current Agent Fleet
 

@@ -24,6 +24,12 @@ function matchField(field: string, value: number, max: number): boolean {
       const [startStr, endStr] = rangeStr!.split("-");
       const start = parseInt(startStr!, 10);
       const end = parseInt(endStr!, 10);
+      if (start > end) {
+        // Wrapped range (e.g. "22-6/2" — overnight active hours)
+        if (value < start && value > end) return false;
+        const offset = value >= start ? value - start : value + (max + 1) - start;
+        return offset % step === 0;
+      }
       if (value < start || value > end) return false;
       return (value - start) % step === 0;
     }
@@ -34,11 +40,16 @@ function matchField(field: string, value: number, max: number): boolean {
     return value >= start && (value - start) % step === 0;
   }
 
-  // Handle ranges: "1-5"
+  // Handle ranges: "1-5". A start greater than the end is a wrapped range —
+  // "22-6" means 22:00 through 06:00 (overnight active hours). The old strict
+  // check made such ranges match nothing, silently disabling the heartbeat.
   if (field.includes("-")) {
     const [startStr, endStr] = field.split("-");
     const start = parseInt(startStr!, 10);
     const end = parseInt(endStr!, 10);
+    if (start > end) {
+      return value >= start || value <= end;
+    }
     return value >= start && value <= end;
   }
 
