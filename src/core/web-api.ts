@@ -3,13 +3,11 @@ import { readdir } from "fs/promises";
 import { log } from "./logger.ts";
 import {
   getClawsterHome,
-  loadConfig,
-  saveAgents,
   saveConfig,
-  type AgentsConfig,
   type ClawsterConfig,
   type LoadedConfig,
 } from "./config.ts";
+import { mutateAgents } from "./config-store.ts";
 import { getSession, clearSession } from "./session-store.ts";
 import type { AgentConfig } from "./types.ts";
 import type { ActivityStatus, ConversationEvent, QueryPriority } from "./agent-runner.ts";
@@ -369,32 +367,38 @@ export function startWebApi(options: WebApiOptions) {
         ...(body.tasks ? { tasks: body.tasks } : {}),
       };
 
-      cfg.agents.agents.push(newAgent);
-      await saveAgents(cfg.agents);
-      const reloaded = await reloadConfig();
+      try {
+        await mutateAgents((agents) => {
+          agents.agents.push(newAgent);
+        });
+      } catch (e) {
+        return withCors(err(`Invalid agent config: ${e instanceof Error ? e.message : e}`, 400));
+      }
       return withCors(json(newAgent, 201));
     }
 
-    // PUT /api/agents/:id — update agent
-    if (path.match(/^\/api\/agents\/[^/]+$/) && method === "PUT") {
+    // PUT/PATCH /api/agents/:id — update agent (web client sends PATCH)
+    if (path.match(/^\/api\/agents\/[^/]+$/) && (method === "PUT" || method === "PATCH")) {
       const id = path.split("/api/agents/")[1]!;
       const cfg = currentConfig();
-      const idx = cfg.agents.agents.findIndex((a) => a.id === id);
-      if (idx === -1) return withCors(err("Agent not found", 404));
+      if (!cfg.agents.agents.some((a) => a.id === id)) {
+        return withCors(err("Agent not found", 404));
+      }
 
       const body = await parseBody<Partial<AgentConfig>>(req);
       if (!body) return withCors(err("Invalid body"));
 
-      const existing = cfg.agents.agents[idx]!;
-      const updated: AgentConfig = {
-        ...existing,
-        ...body,
-        id, // ID is immutable
-      };
-
-      cfg.agents.agents[idx] = updated;
-      await saveAgents(cfg.agents);
-      await reloadConfig();
+      let updated: AgentConfig | undefined;
+      try {
+        await mutateAgents((agents) => {
+          const idx = agents.agents.findIndex((a) => a.id === id);
+          if (idx === -1) return;
+          updated = { ...agents.agents[idx]!, ...body, id /* ID is immutable */ };
+          agents.agents[idx] = updated;
+        });
+      } catch (e) {
+        return withCors(err(`Invalid agent config: ${e instanceof Error ? e.message : e}`, 400));
+      }
       return withCors(json(updated));
     }
 
@@ -402,12 +406,18 @@ export function startWebApi(options: WebApiOptions) {
     if (path.match(/^\/api\/agents\/[^/]+$/) && method === "DELETE") {
       const id = path.split("/api/agents/")[1]!;
       const cfg = currentConfig();
-      const idx = cfg.agents.agents.findIndex((a) => a.id === id);
-      if (idx === -1) return withCors(err("Agent not found", 404));
+      if (!cfg.agents.agents.some((a) => a.id === id)) {
+        return withCors(err("Agent not found", 404));
+      }
 
-      cfg.agents.agents.splice(idx, 1);
-      await saveAgents(cfg.agents);
-      await reloadConfig();
+      try {
+        await mutateAgents((agents) => {
+          const idx = agents.agents.findIndex((a) => a.id === id);
+          if (idx !== -1) agents.agents.splice(idx, 1);
+        });
+      } catch (e) {
+        return withCors(err(`Could not remove agent: ${e instanceof Error ? e.message : e}`, 400));
+      }
       return withCors(json({ ok: true }));
     }
 

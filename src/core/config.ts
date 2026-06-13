@@ -270,18 +270,29 @@ export async function loadConfig(): Promise<LoadedConfig> {
   return { config, agents: rawAgents, chatIdToAgent, agentById, defaultAgent };
 }
 
+/** Write a JSON file atomically (tmp + rename) so a crash mid-write can't corrupt it. */
+async function writeJsonAtomic(path: string, data: unknown): Promise<void> {
+  const tmp = `${path}.tmp`;
+  await writeFile(tmp, JSON.stringify(data, null, 2));
+  await rename(tmp, path);
+}
+
 export async function saveAgents(agents: AgentsConfig): Promise<void> {
+  // Never persist a fleet config the next startup would refuse to load —
+  // loadConfig() throws on schema violations, so an invalid write here would
+  // brick the daemon hours later with no obvious cause.
+  AgentsConfigSchema.parse(agents);
   const home = getClawsterHome();
   await mkdir(home, { recursive: true });
-  await Bun.write(join(home, "agents.json"), JSON.stringify(agents, null, 2));
+  await writeJsonAtomic(join(home, "agents.json"), agents);
 }
 
 export async function saveConfig(config: ClawsterConfig): Promise<void> {
   const home = getClawsterHome();
   await mkdir(home, { recursive: true });
-  // Strip secrets from disk — they should live in env vars only
+  // Strip secrets from disk — they live in ~/.clawster/env or real env vars
   const { botToken, groqKey, ...safeConfig } = config;
-  await Bun.write(join(home, "config.json"), JSON.stringify(safeConfig, null, 2));
+  await writeJsonAtomic(join(home, "config.json"), safeConfig);
 }
 
 /** Load or generate the API token for web API authentication. */
