@@ -70,7 +70,7 @@ When prompted:
 ### 7. Restart Clawster
 
 ```bash
-clawster stop && clawster start
+clawster restart
 ```
 
 ### 8. Test it

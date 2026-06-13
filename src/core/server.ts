@@ -9,6 +9,7 @@ import { acquireLock, releaseLock } from "./lock.ts";
 import { log } from "./logger.ts";
 import { startWebApi } from "./web-api.ts";
 import { startScheduler } from "./scheduler.ts";
+import { walPending, walDone } from "./message-wal.ts";
 
 export async function startServer() {
   const lockAcquired = await acquireLock();
@@ -76,6 +77,31 @@ export async function startServer() {
   await bot.init();
   log.info("orchestrator", "Bot is running!");
   const botHandle: RunnerHandle = run(bot);
+
+  // Report messages orphaned by a mid-processing restart (WAL entries that
+  // never got their reply). Without this, a crash between Telegram's ack and
+  // our reply loses the message with zero trace.
+  (async () => {
+    const orphans = await walPending();
+    for (const orphan of orphans) {
+      try {
+        await bot.api.sendMessage(
+          orphan.chatId,
+          `⚠️ I restarted while working on this message and may not have answered it:\n\n"${orphan.text.slice(0, 300)}"\n\nResend it if you still need a reply.`,
+          orphan.topicId ? { message_thread_id: orphan.topicId } : undefined,
+        );
+      } catch (err) {
+        log.warn("orchestrator", "Could not notify orphaned message", {
+          chatId: orphan.chatId,
+          error: String(err),
+        });
+      }
+      await walDone(orphan.id);
+    }
+    if (orphans.length > 0) {
+      log.info("orchestrator", `Reported ${orphans.length} orphaned message(s) from WAL`);
+    }
+  })().catch((err) => log.warn("orchestrator", "WAL orphan sweep failed", { error: String(err) }));
 
   let webServer: { stop(): void } | undefined;
   webServer = startWebApi({

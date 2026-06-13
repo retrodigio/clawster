@@ -52,8 +52,14 @@ export interface ConversationEvent {
 export function createAgentRunner(options: {
   maxConcurrent: number;
   mcpConfigPath: string;
+  /**
+   * SDK query factory — injectable so tests can drive runStreaming with
+   * scripted message sequences instead of a real claude subprocess.
+   */
+  queryFn?: (args: { prompt: string; options: Options }) => Query;
 }) {
   const { maxConcurrent, mcpConfigPath } = options;
+  const queryFn = options.queryFn ?? query;
   const semaphore = createSemaphore(maxConcurrent);
   const agentMutex = new Map<string, Promise<void>>();
   const activeQueries = new Map<string, RunningQuery>();
@@ -275,7 +281,7 @@ export function createAgentRunner(options: {
   async function run(
     agent: AgentConfig,
     prompt: string,
-    runOptions?: { topicId?: number; timeout?: number; priority?: QueryPriority },
+    runOptions?: { topicId?: number; timeout?: number; priority?: QueryPriority; sessionScope?: string },
   ): Promise<string> {
     const { text } = await runStreaming(agent, prompt, () => {}, runOptions);
     return text;
@@ -294,6 +300,12 @@ export function createAgentRunner(options: {
       topicId?: number;
       timeout?: number;
       priority?: QueryPriority;
+      /**
+       * Extra session-key discriminator. Scheduled runs pass "scheduled" so
+       * heartbeats keep their own conversation instead of forking — and then
+       * overwriting — the user's session pointer.
+       */
+      sessionScope?: string;
       onActivity?: (status: ActivityStatus) => void;
       onEvent?: (event: ConversationEvent) => void;
       /**
@@ -345,7 +357,7 @@ export function createAgentRunner(options: {
         // for >inactivityTimeout mid-response. Other errors propagate normally.
         for (let attemptNo = 1; attemptNo <= MAX_ATTEMPTS; attemptNo++) {
         const isRetry = attemptNo > 1;
-        const session = await getSession(agent.id, runOptions?.topicId);
+        const session = await getSession(agent.id, runOptions?.topicId, runOptions?.sessionScope);
         // First attempt: honor any interruptedSessionId. Retry: use whatever
         // session got saved during the previous attempt's timeout.
         const resumeSessionId = isRetry
@@ -367,7 +379,7 @@ export function createAgentRunner(options: {
         const abortController = new AbortController();
         opts.abortController = abortController;
 
-        const q = query({ prompt, options: opts });
+        const q = queryFn({ prompt, options: opts });
         const timer = createActivityTimeout(agent.id, abortController, inactivityTimeout, maxTimeout);
 
         const runningQuery: RunningQuery = {
@@ -501,7 +513,7 @@ export function createAgentRunner(options: {
                 lastActivity: new Date().toISOString(),
                 lastHeartbeat: session?.lastHeartbeat ?? null,
                 messageCount: session?.messageCount ?? 0,
-              }, runOptions?.topicId);
+              }, runOptions?.topicId, runOptions?.sessionScope);
             }
             if (attemptNo < MAX_ATTEMPTS) {
               log.warn(agent.id, "Inactivity timeout — retrying with resumed session", {
@@ -522,7 +534,7 @@ export function createAgentRunner(options: {
             lastActivity: new Date().toISOString(),
             lastHeartbeat: session?.lastHeartbeat ?? null,
             messageCount: (session?.messageCount ?? 0) + 1,
-          }, runOptions?.topicId);
+          }, runOptions?.topicId, runOptions?.sessionScope);
 
           log.info(agent.id, "SDK streaming query completed", {
             sessionId: sessionId?.slice(0, 12),
@@ -559,7 +571,7 @@ export function createAgentRunner(options: {
                 lastActivity: new Date().toISOString(),
                 lastHeartbeat: session?.lastHeartbeat ?? null,
                 messageCount: session?.messageCount ?? 0,
-              }, runOptions?.topicId);
+              }, runOptions?.topicId, runOptions?.sessionScope);
             }
             if (attemptNo < MAX_ATTEMPTS) {
               log.warn(agent.id, "Inactivity timeout — retrying with resumed session", {
@@ -589,7 +601,7 @@ export function createAgentRunner(options: {
               staleSessionId: resumeSessionId.slice(0, 12),
               attempt: attemptNo,
             });
-            await clearSession(agent.id, runOptions?.topicId);
+            await clearSession(agent.id, runOptions?.topicId, runOptions?.sessionScope);
             continue;
           }
           outcome = "error";

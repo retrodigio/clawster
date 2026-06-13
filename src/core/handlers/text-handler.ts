@@ -7,6 +7,7 @@ import { toTelegramHtml, toTelegramHtmlPartial } from "../telegram-format.ts";
 import { parseIntents, processIntents } from "../intent-parser.ts";
 import { classifyInflightIntent } from "../inflight-policy.ts";
 import { log } from "../logger.ts";
+import { walAppend, walDone } from "../message-wal.ts";
 import { registerTopic } from "../router.ts";
 import type { HandlerDeps } from "./types.ts";
 import { safeSend, safeReact, resolveTopicName } from "./shared.ts";
@@ -77,6 +78,17 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
     };
 
     const prompt = buildPrompt(agent, ctx.message.text, messageContext);
+
+    // WAL: record the accepted message so a process death mid-turn doesn't
+    // lose it silently. Removed in the finally below once the user has seen
+    // a reply (or an error notice). Orphans are reported at next startup.
+    const walId = await walAppend({
+      chatId,
+      topicId,
+      agentId: agent.id,
+      text: ctx.message.text,
+      receivedAt: new Date().toISOString(),
+    });
 
     let typingInterval: ReturnType<typeof setInterval> | undefined;
     let streamMsgId: number | undefined;
@@ -293,9 +305,13 @@ export function registerTextHandler(bot: Bot, deps: HandlerDeps): void {
         : looksStalled
           ? "Upstream stalled before I could reply. Want me to retry?"
           : "Sorry, something went wrong processing your message.";
-      await safeSend(() => ctx.reply(fallbackMsg));
+      // Keep the error notice in the conversation's topic, not General.
+      await safeSend(() => ctx.reply(fallbackMsg, topicId ? { message_thread_id: topicId } : undefined));
     } finally {
       if (typingInterval) clearInterval(typingInterval);
+      // The user got feedback on every path through here (reply, fallback, or
+      // an interrupting message that produces its own reply) — clear the WAL.
+      walDone(walId).catch(() => {});
     }
   });
 }
