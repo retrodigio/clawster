@@ -62,9 +62,8 @@ function err(message: string, status = 400): Response {
   return json({ error: message }, status);
 }
 
-/** CORS headers for dev mode (Vite on :5173 → API on :18800). */
+/** CORS method/header allowances (origin is decided per-request, never `*`). */
 const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
@@ -94,10 +93,36 @@ export function startWebApi(options: WebApiOptions) {
     return url.searchParams.get("token") === apiToken;
   }
 
-  /** Check if request originates from localhost. */
-  function isLocalhost(req: Request): boolean {
+  // Origins allowed to read API responses from a browser (dashboard + Vite dev server).
+  const allowedOrigins = new Set([
+    `http://localhost:${port}`,
+    `http://127.0.0.1:${port}`,
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+  ]);
+
+  /** Reflect the request origin only if it's the dashboard; never `*`. */
+  function applyCorsOrigin(req: Request, res: Response): Response {
+    const origin = req.headers.get("origin");
+    if (origin && allowedOrigins.has(origin)) {
+      res.headers.set("Access-Control-Allow-Origin", origin);
+      res.headers.set("Vary", "Origin");
+    }
+    return res;
+  }
+
+  /**
+   * Token-disclosure guard: the socket peer must be loopback (stops LAN/remote
+   * callers — the Host header is client-controlled and can't be trusted), AND
+   * the Host header must be a localhost name (stops DNS-rebinding pages, whose
+   * loopback-socket requests carry their own hostname in Host).
+   */
+  function isLoopbackRequest(req: Request): boolean {
+    const ip = server.requestIP(req)?.address ?? "";
+    const socketIsLoopback = ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
     const host = req.headers.get("host") || "";
-    return host.startsWith("localhost") || host.startsWith("127.0.0.1");
+    const hostIsLocal = host.startsWith("localhost") || host.startsWith("127.0.0.1");
+    return socketIsLoopback && hostIsLocal;
   }
 
   // Track active WebSocket connections per agent
@@ -109,70 +134,14 @@ export function startWebApi(options: WebApiOptions) {
 
   const server = Bun.serve({
     port,
+    // Loopback only — the API grants agent execution; it must never be LAN-reachable.
+    hostname: "127.0.0.1",
     fetch(req, server) {
-      const url = new URL(req.url);
-      const path = url.pathname;
-
-      // CORS preflight
-      if (req.method === "OPTIONS") {
-        return withCors(new Response(null, { status: 204 }));
+      const result = route(req, server);
+      if (result instanceof Promise) {
+        return result.then((res) => (res ? applyCorsOrigin(req, res) : res));
       }
-
-      // Skip auth for health endpoint (monitoring)
-      // Skip auth for /metrics (standard Prometheus scrape convention)
-      // Skip auth for static files (web UI serves itself, uses token in API calls)
-      // Require auth for /api/* and /ws/*
-
-      // Prometheus metrics endpoint — unauthenticated (standard scrape convention; localhost-only by default).
-      if (path === "/metrics" && req.method === "GET") {
-        return (async () => {
-          try {
-            const cfg = currentConfig();
-            agentsConfigured.set(cfg.agentById.size);
-            const sessionsDir = join(getClawsterHome(), "sessions");
-            try {
-              const files = await readdir(sessionsDir);
-              sessionsActive.set(files.filter((f) => f.endsWith(".json")).length);
-            } catch { /* sessions dir may not exist yet */ }
-          } catch { /* best-effort refresh */ }
-          return withCors(new Response(renderMetrics(), {
-            status: 200,
-            headers: { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" },
-          }));
-        })();
-      }
-
-      // WebSocket upgrade for chat — authenticate via query param
-      if (path.startsWith("/ws/chat/")) {
-        if (!checkQueryAuth(url)) {
-          return withCors(err("Unauthorized", 401));
-        }
-
-        const agentId = path.split("/ws/chat/")[1];
-        if (!agentId) return withCors(err("Missing agent ID"));
-
-        const cfg = currentConfig();
-        const agent = cfg.agentById.get(agentId);
-        if (!agent) return withCors(err("Agent not found", 404));
-
-        const upgraded = server.upgrade(req, { data: { agentId, agent } } as any);
-        if (!upgraded) return withCors(err("WebSocket upgrade failed", 500));
-        return undefined as unknown as Response;
-      }
-
-      // Serve static files for the web UI (no auth required)
-      if (!path.startsWith("/api/") && !path.startsWith("/ws/") && path !== "/health") {
-        return serveStatic(path);
-      }
-
-      // Auth check for /api/* endpoints (except /health and /api/auth/token)
-      if (path.startsWith("/api/") && path !== "/api/auth/token") {
-        if (!checkBearerAuth(req)) {
-          return withCors(err("Unauthorized", 401));
-        }
-      }
-
-      return handleApi(req, url, path);
+      return result ? applyCorsOrigin(req, result) : (result as unknown as Response);
     },
 
     websocket: {
@@ -254,6 +223,72 @@ export function startWebApi(options: WebApiOptions) {
     },
   });
 
+  function route(req: Request, server: any): Response | Promise<Response> | undefined {
+      const url = new URL(req.url);
+      const path = url.pathname;
+
+      // CORS preflight
+      if (req.method === "OPTIONS") {
+        return withCors(new Response(null, { status: 204 }));
+      }
+
+      // Skip auth for health endpoint (monitoring)
+      // Skip auth for /metrics (standard Prometheus scrape convention)
+      // Skip auth for static files (web UI serves itself, uses token in API calls)
+      // Require auth for /api/* and /ws/*
+
+      // Prometheus metrics endpoint — unauthenticated (standard scrape convention; localhost-only by default).
+      if (path === "/metrics" && req.method === "GET") {
+        return (async () => {
+          try {
+            const cfg = currentConfig();
+            agentsConfigured.set(cfg.agentById.size);
+            const sessionsDir = join(getClawsterHome(), "sessions");
+            try {
+              const files = await readdir(sessionsDir);
+              sessionsActive.set(files.filter((f) => f.endsWith(".json")).length);
+            } catch { /* sessions dir may not exist yet */ }
+          } catch { /* best-effort refresh */ }
+          return withCors(new Response(renderMetrics(), {
+            status: 200,
+            headers: { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" },
+          }));
+        })();
+      }
+
+      // WebSocket upgrade for chat — authenticate via query param
+      if (path.startsWith("/ws/chat/")) {
+        if (!checkQueryAuth(url)) {
+          return withCors(err("Unauthorized", 401));
+        }
+
+        const agentId = path.split("/ws/chat/")[1];
+        if (!agentId) return withCors(err("Missing agent ID"));
+
+        const cfg = currentConfig();
+        const agent = cfg.agentById.get(agentId);
+        if (!agent) return withCors(err("Agent not found", 404));
+
+        const upgraded = server.upgrade(req, { data: { agentId, agent } } as any);
+        if (!upgraded) return withCors(err("WebSocket upgrade failed", 500));
+        return undefined as unknown as Response;
+      }
+
+      // Serve static files for the web UI (no auth required)
+      if (!path.startsWith("/api/") && !path.startsWith("/ws/") && path !== "/health") {
+        return serveStatic(path);
+      }
+
+      // Auth check for /api/* endpoints (except /health and /api/auth/token)
+      if (path.startsWith("/api/") && path !== "/api/auth/token") {
+        if (!checkBearerAuth(req)) {
+          return withCors(err("Unauthorized", 401));
+        }
+      }
+
+      return handleApi(req, url, path);
+  }
+
   async function serveStatic(path: string): Promise<Response> {
     const webDir = join(import.meta.dir, "..", "..", "dist", "web");
     let filePath = join(webDir, path === "/" ? "index.html" : path);
@@ -275,9 +310,9 @@ export function startWebApi(options: WebApiOptions) {
   async function handleApi(req: Request, url: URL, path: string): Promise<Response> {
     const method = req.method;
 
-    // GET /api/auth/token — return token only to localhost requests
+    // GET /api/auth/token — return token only to genuine loopback requests
     if (path === "/api/auth/token" && method === "GET") {
-      if (!isLocalhost(req)) {
+      if (!isLoopbackRequest(req)) {
         return withCors(err("Forbidden — token only available from localhost", 403));
       }
       return withCors(json({ token: apiToken }));
