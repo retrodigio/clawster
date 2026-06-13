@@ -42,4 +42,9 @@ program.addCommand(migrateCommand);
 program.addCommand(msgCommand);
 program.addCommand(browserCommand);
 
-program.parse();
+// parseAsync so errors thrown in async command actions surface as clean
+// messages instead of unhandled-rejection stack traces.
+program.parseAsync().catch((err) => {
+  console.error(err instanceof Error ? err.message : String(err));
+  process.exit(1);
+});

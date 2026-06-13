@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { readFile } from "fs/promises";
 import { existsSync } from "fs";
 import { join } from "path";
-import { getClawsterHome, loadConfig } from "../core/config.ts";
+import { getClawsterHome } from "../core/config.ts";
 
 /**
  * Read the Clawster API bearer token from ~/.clawster/api-token.
@@ -20,10 +20,18 @@ async function loadApiToken(): Promise<string> {
   return token;
 }
 
-/** Resolve the base URL of the running Clawster API (health port from config). */
+/**
+ * Resolve the base URL of the running Clawster API. Reads config.json directly
+ * rather than via loadConfig() — the full loader validates secrets (bot token)
+ * that aren't needed to talk to the local API, and would fail in shells where
+ * only the daemon has them.
+ */
 async function loadBaseUrl(): Promise<string> {
-  const cfg = await loadConfig();
-  const port = cfg.config.healthPort ?? 18800;
+  let port = 18800;
+  try {
+    const raw = JSON.parse(await readFile(join(getClawsterHome(), "config.json"), "utf-8"));
+    if (typeof raw.healthPort === "number") port = raw.healthPort;
+  } catch { /* default port */ }
   return `http://localhost:${port}`;
 }
 

@@ -1,10 +1,10 @@
 import { Command } from "commander";
 import { createInterface } from "readline";
 import { existsSync } from "fs";
-import { mkdir } from "fs/promises";
+import { mkdir, copyFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
-import { getClawsterHome, saveConfig, saveAgents } from "../core/config.ts";
+import { getClawsterHome, saveConfig, saveAgents, saveEnvVar, getEnvFilePath } from "../core/config.ts";
 import type { ClawsterConfig, AgentsConfig } from "../core/config.ts";
 
 function ask(question: string, defaultValue?: string): Promise<string> {
@@ -56,7 +56,7 @@ When ${userName || "the user"} wants to add a new project:
 1. \`clawster workspace init /path/to/project --name "ProjectName"\` to generate CLAUDE.md
 2. \`clawster agent add projectname\` to configure the agent (workspace path, Telegram group)
 3. \`clawster agent discover\` if they need to find the Telegram chat ID
-4. Restart: \`clawster stop && clawster start\`
+4. Restart: \`clawster restart\`
 
 ### Scheduled Tasks
 Agents can have scheduled tasks with cron expressions. Edit \`~/.clawster/agents.json\`:
@@ -117,7 +117,7 @@ Split long responses naturally. Avoid markdown tables in Telegram.
 - When you learn something important, save it with \`ob capture\`
 - You can run any \`clawster\` CLI command via bash
 - You can read and edit \`~/.clawster/agents.json\` directly for advanced config
-- After config changes, remind the user to restart: \`clawster stop && clawster start\`
+- After config changes, remind the user to restart: \`clawster restart\`
 `;
 }
 
@@ -128,12 +128,23 @@ export const initCommand = new Command("init")
 
     const home = getClawsterHome();
 
-    // Check existing config
-    if (existsSync(home)) {
+    // Check existing config — keyed on config.json, not the directory (which
+    // may exist with just logs/). On overwrite, back up the files we replace:
+    // agents.json may describe a whole fleet.
+    if (existsSync(join(home, "config.json"))) {
       const overwrite = await ask("Config exists. Overwrite? (y/N)", "N");
       if (overwrite.toLowerCase() !== "y") {
         console.log("Aborted.");
         return;
+      }
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      for (const f of ["config.json", "agents.json"]) {
+        const src = join(home, f);
+        if (existsSync(src)) {
+          const backup = `${src}.bak.${stamp}`;
+          await copyFile(src, backup);
+          console.log(`Backed up ${f} → ${backup}`);
+        }
       }
     }
 
@@ -172,7 +183,10 @@ export const initCommand = new Command("init")
     await mkdir(join(home, "sessions"), { recursive: true });
     await mkdir(join(home, "logs"), { recursive: true });
 
-    // Write config
+    // Write config. saveConfig deliberately strips secrets from config.json —
+    // they live in ~/.clawster/env (0600), which loadConfig and `clawster
+    // daemon install` both read. Without this, a fresh init produced a config
+    // that failed validation on the very next start.
     const config: ClawsterConfig = {
       botToken,
       allowedUserId,
@@ -183,6 +197,9 @@ export const initCommand = new Command("init")
       ...(groqKey ? { groqKey } : {}),
     };
     await saveConfig(config);
+    await saveEnvVar("CLAWSTER_BOT_TOKEN", botToken);
+    if (groqKey) await saveEnvVar("CLAWSTER_GROQ_KEY", groqKey);
+    console.log(`\nSecrets saved to ${getEnvFilePath()} (mode 0600).`);
 
     // Write agents
     const agents: AgentsConfig = {

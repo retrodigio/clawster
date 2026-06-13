@@ -77,7 +77,10 @@ export async function startServer() {
   });
   startScheduler(agents.agents, runner, config.botToken, config.timezone);
 
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return; // second signal while draining — ignore
+    shuttingDown = true;
     log.info("orchestrator", "Shutting down gracefully...");
 
     // 1. Stop accepting new Telegram messages

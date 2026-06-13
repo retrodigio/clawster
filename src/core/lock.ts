@@ -32,13 +32,9 @@ export async function acquireLock(): Promise<boolean> {
 
     await writeFile(lockFile, String(process.pid), "utf-8");
 
-    const cleanup = async () => {
-      await releaseLock();
-      process.exit(0);
-    };
-
-    process.on("SIGINT", cleanup);
-    process.on("SIGTERM", cleanup);
+    // NOTE: no signal handlers here. The orchestrator's shutdown path in
+    // server.ts owns SIGINT/SIGTERM and releases the lock after draining —
+    // a second handler that exits early would skip the graceful drain.
 
     log.info("system", "Lock acquired", { pid: process.pid });
     return true;

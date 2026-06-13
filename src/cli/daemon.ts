@@ -3,7 +3,7 @@ import { existsSync } from "fs";
 import { mkdir, unlink, writeFile } from "fs/promises";
 import { homedir, platform } from "os";
 import { join } from "path";
-import { getClawsterHome } from "../core/config.ts";
+import { getClawsterHome, readEnvFile, getEnvFilePath } from "../core/config.ts";
 
 const LABEL = "com.clawster.daemon";
 const PLIST_NAME = `${LABEL}.plist`;
@@ -37,7 +37,28 @@ function xmlEscape(s: string): string {
     .replace(/'/g, "&apos;");
 }
 
-function generatePlist(bunPath: string, cliPath: string, home: string): string {
+/**
+ * Read EnvironmentVariables from an already-installed plist so a reinstall
+ * never silently drops vars the user added by hand (bot token, feature flags).
+ */
+async function readExistingPlistEnv(plistPath: string): Promise<Record<string, string>> {
+  if (!existsSync(plistPath)) return {};
+  try {
+    const proc = Bun.spawn(["plutil", "-convert", "json", "-o", "-", plistPath], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const out = await new Response(proc.stdout).text();
+    await proc.exited;
+    if (proc.exitCode !== 0) return {};
+    const parsed = JSON.parse(out) as { EnvironmentVariables?: Record<string, string> };
+    return parsed.EnvironmentVariables ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function generatePlist(bunPath: string, cliPath: string, home: string, extraEnv: Record<string, string>): string {
   const logsDir = join(home, "logs");
   const userHome = homedir();
   const pathDirs = new Set<string>();
@@ -53,6 +74,16 @@ function generatePlist(bunPath: string, cliPath: string, home: string): string {
 
   const pathString = [...pathDirs].join(":");
   const x = xmlEscape;
+
+  // PATH and HOME are always regenerated; everything else is carried over.
+  const envEntries: Record<string, string> = {
+    ...extraEnv,
+    PATH: pathString,
+    HOME: userHome,
+  };
+  const envXml = Object.entries(envEntries)
+    .map(([k, v]) => `    <key>${x(k)}</key>\n    <string>${x(v)}</string>`)
+    .join("\n");
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -71,10 +102,7 @@ function generatePlist(bunPath: string, cliPath: string, home: string): string {
   <string>${x(home)}</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key>
-    <string>${x(pathString)}</string>
-    <key>HOME</key>
-    <string>${x(userHome)}</string>
+${envXml}
   </dict>
   <key>KeepAlive</key>
   <true/>
@@ -106,7 +134,26 @@ async function installLaunchd() {
   await mkdir(join(home, "logs"), { recursive: true });
   await mkdir(getLaunchAgentsDir(), { recursive: true });
 
-  const plist = generatePlist(bunPath, cliPath, home);
+  // Merge env sources: existing plist vars (hand edits survive reinstall),
+  // then ~/.clawster/env (the durable secrets home — wins on conflict).
+  const existingEnv = await readExistingPlistEnv(getPlistPath());
+  delete existingEnv.PATH;
+  delete existingEnv.HOME;
+  const fileEnv = await readEnvFile();
+  const extraEnv = { ...existingEnv, ...fileEnv };
+  const carried = Object.keys(extraEnv);
+  if (carried.length > 0) {
+    console.log(`Carrying env vars into the daemon: ${carried.join(", ")}`);
+  }
+  if (!extraEnv.CLAWSTER_BOT_TOKEN && !process.env.CLAWSTER_BOT_TOKEN) {
+    console.warn(
+      `Warning: CLAWSTER_BOT_TOKEN not found in ${getEnvFilePath()} or the existing daemon config.\n` +
+      "The daemon will fail to start without it. Add it with:\n" +
+      `  echo 'CLAWSTER_BOT_TOKEN=<your-token>' >> ${getEnvFilePath()} && chmod 600 ${getEnvFilePath()}`,
+    );
+  }
+
+  const plist = generatePlist(bunPath, cliPath, home, extraEnv);
   await Bun.write(getPlistPath(), plist);
   console.log(`Plist written to ${getPlistPath()}`);
 
@@ -167,7 +214,7 @@ function getServicePath(): string {
   return join(getSystemdDir(), SYSTEMD_SERVICE);
 }
 
-function generateSystemdUnit(bunPath: string, cliPath: string, home: string): string {
+function generateSystemdUnit(bunPath: string, cliPath: string, home: string, extraEnv: Record<string, string>): string {
   const logsDir = join(home, "logs");
   const userHome = homedir();
 
@@ -196,6 +243,7 @@ ExecStart="${bunPath}" "${cliPath}" start --foreground
 WorkingDirectory=${home}
 Environment="PATH=${pathDirs.join(":")}"
 Environment="HOME=${userHome}"
+${Object.entries(extraEnv).map(([k, v]) => `Environment="${k}=${v}"`).join("\n")}
 Restart=on-failure
 RestartSec=10
 StandardOutput=append:${join(logsDir, "clawster.log")}
@@ -222,7 +270,10 @@ async function installSystemd() {
   await mkdir(join(home, "logs"), { recursive: true });
   await mkdir(getSystemdDir(), { recursive: true });
 
-  const unit = generateSystemdUnit(bunPath, cliPath, home);
+  const fileEnv = await readEnvFile();
+  delete fileEnv.PATH;
+  delete fileEnv.HOME;
+  const unit = generateSystemdUnit(bunPath, cliPath, home, fileEnv);
   await writeFile(getServicePath(), unit);
   console.log(`Service unit written to ${getServicePath()}`);
 

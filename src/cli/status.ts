@@ -69,8 +69,12 @@ export const statusCommand = new Command("status")
       const data = (await resp.json()) as Record<string, unknown>;
       console.log(`  Health:  ${resp.status === 200 ? "OK" : "unhealthy"}`);
       if (data.agents) console.log(`  Agents:  ${data.agents}`);
-      if (data.uptime) console.log(`  Uptime:  ${data.uptime}s`);
-      if (data.lastActivity) console.log(`  Last:    ${data.lastActivity}`);
+      if (typeof data.uptime === "number") {
+        const s = Math.floor(data.uptime);
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        console.log(`  Uptime:  ${h > 0 ? `${h}h ` : ""}${m}m ${s % 60}s`);
+      }
     } catch {
       console.log("  Health:  endpoint unreachable");
     }
@@ -99,6 +103,20 @@ export const statusCommand = new Command("status")
           console.log(`    ${line}`);
         }
         break;
+      }
+    }
+
+    // When the process is down, the reason is almost always in the error log
+    // (startup crashes go to stderr, which launchd routes there).
+    if (!running) {
+      const errorLog = join(home, "logs", "clawster.error.log");
+      const errLines = lastLines(errorLog, 8);
+      if (errLines.length > 0) {
+        console.log(`\n  Recent errors (${errorLog}):`);
+        for (const line of errLines) {
+          console.log(`    ${line}`);
+        }
+        console.log("\n  Full error log: clawster logs --error");
       }
     }
 

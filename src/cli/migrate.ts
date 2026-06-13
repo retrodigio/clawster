@@ -4,7 +4,7 @@ import { existsSync } from "fs";
 import { mkdir } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
-import { getClawsterHome, saveConfig, saveAgents } from "../core/config.ts";
+import { getClawsterHome, saveConfig, saveAgents, saveEnvVar, getEnvFilePath } from "../core/config.ts";
 import type { ClawsterConfig, AgentsConfig } from "../core/config.ts";
 
 interface OldConfig {
@@ -109,6 +109,10 @@ export const migrateCommand = new Command("migrate")
 
     await saveConfig(config);
     console.log("  Wrote config.json");
+    // saveConfig strips secrets — persist them to the env file or the next
+    // start fails validation.
+    await saveEnvVar("CLAWSTER_BOT_TOKEN", botToken);
+    console.log(`  Wrote bot token to ${getEnvFilePath()} (mode 0600)`);
 
     // Convert agents
     const agents: AgentsConfig = {
