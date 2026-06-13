@@ -2,66 +2,13 @@ import { query, type Query, type Options } from "@anthropic-ai/claude-agent-sdk"
 import { log } from "./logger.ts";
 import type { AgentConfig } from "./types.ts";
 import { getSession, saveSession, clearSession } from "./session-store.ts";
-import {
-  messagesTotal,
-  queryDurationSeconds,
-  semaphoreQueueDepth,
-  semaphoreInFlight,
-} from "./metrics.ts";
+import { messagesTotal, queryDurationSeconds } from "./metrics.ts";
+import { createSemaphore, type QueryPriority } from "./semaphore.ts";
+import { createToolAwareActivityTimeout } from "./activity-timeout.ts";
 
-export type QueryPriority = "high" | "low";
-
-type QueuedResolve = () => void;
-
-/**
- * Priority-aware semaphore.
- * - Two FIFO queues: "high" (user messages) and "low" (heartbeats/scheduled).
- * - When a slot opens, oldest "high" is dequeued first, then oldest "low".
- */
-function createSemaphore(max: number) {
-  let active = 0;
-  const highQueue: QueuedResolve[] = [];
-  const lowQueue: QueuedResolve[] = [];
-
-  function updateDepthGauges(): void {
-    semaphoreQueueDepth.set(highQueue.length, { priority: "high" });
-    semaphoreQueueDepth.set(lowQueue.length, { priority: "low" });
-    semaphoreInFlight.set(active);
-  }
-
-  function acquire(priority: QueryPriority): Promise<void> {
-    if (active < max) {
-      active++;
-      updateDepthGauges();
-      return Promise.resolve();
-    }
-    return new Promise<void>((resolve) => {
-      if (priority === "high") {
-        highQueue.push(resolve);
-      } else {
-        lowQueue.push(resolve);
-      }
-      updateDepthGauges();
-    });
-  }
-
-  function release(): void {
-    // Drain high before low.
-    const next = highQueue.shift() ?? lowQueue.shift();
-    if (next) {
-      // Slot handed off — in-flight count stays the same.
-      next();
-    } else {
-      active--;
-    }
-    updateDepthGauges();
-  }
-
-  // Initialise gauges at zero.
-  updateDepthGauges();
-
-  return { acquire, release };
-}
+export type { QueryPriority };
+// Re-exported so existing imports (tests) keep working after the extraction.
+export { createToolAwareActivityTimeout };
 
 interface RunningQuery {
   query: Query;
@@ -100,114 +47,6 @@ export interface ConversationEvent {
   type: "system" | "user" | "assistant" | "tool_use" | "tool_result" | "text_delta" | "thinking" | "result";
   timestamp: string;
   data: any;
-}
-
-/**
- * Standalone activity-timeout factory exposed for unit testing.
- * Tool-aware: while toolsInFlight > 0, the effective inactivity ceiling is promoted to maxMs.
- *
- * See `createActivityTimeout` inside `createAgentRunner` for the production variant — this
- * mirrors the same logic without closing over agent/logger state (logs go through the
- * `onTimeout` callback for test assertions).
- */
-export function createToolAwareActivityTimeout(options: {
-  inactivityMs: number;
-  maxMs: number;
-  onTimeout: (reason: "inactivity" | "max", info: { elapsedMs: number; toolsInFlight: number }) => void;
-  now?: () => number;
-}) {
-  const now = options.now ?? (() => Date.now());
-  const { inactivityMs, maxMs, onTimeout } = options;
-  const startTime = now();
-  let timedOut = false;
-  let inactivityTimer: ReturnType<typeof setTimeout>;
-  let maxTimer: ReturnType<typeof setTimeout>;
-  let toolsInFlight = 0;
-  const openToolIds = new Set<string>();
-
-  function resetInactivityTimer() {
-    clearTimeout(inactivityTimer);
-    const ms = toolsInFlight > 0 ? maxMs : inactivityMs;
-    inactivityTimer = setTimeout(() => {
-      if (timedOut) return;
-      timedOut = true;
-      onTimeout("inactivity", { elapsedMs: now() - startTime, toolsInFlight });
-    }, ms);
-  }
-
-  resetInactivityTimer();
-
-  maxTimer = setTimeout(() => {
-    if (timedOut) return;
-    timedOut = true;
-    onTimeout("max", { elapsedMs: now() - startTime, toolsInFlight });
-  }, maxMs);
-
-  function trackMessage(message: any): number {
-    let delta = 0;
-    if (!message || typeof message !== "object") return delta;
-    if (message.type === "assistant" && message.message?.content) {
-      const content = message.message.content;
-      if (Array.isArray(content)) {
-        for (const block of content) {
-          if (block && block.type === "tool_use") {
-            const id = typeof block.id === "string" ? block.id : null;
-            if (id) {
-              if (!openToolIds.has(id)) {
-                openToolIds.add(id);
-                toolsInFlight++;
-                delta++;
-              }
-            } else {
-              toolsInFlight++;
-              delta++;
-            }
-          }
-        }
-      }
-    }
-    if (message.type === "user" && message.message?.content) {
-      const content = message.message.content;
-      if (Array.isArray(content)) {
-        for (const block of content) {
-          if (block && block.type === "tool_result") {
-            const id = typeof block.tool_use_id === "string" ? block.tool_use_id : null;
-            if (id && openToolIds.has(id)) {
-              openToolIds.delete(id);
-              if (toolsInFlight > 0) {
-                toolsInFlight--;
-                delta--;
-              }
-            } else if (toolsInFlight > 0) {
-              toolsInFlight--;
-              delta--;
-            }
-          }
-        }
-      }
-    }
-    return delta;
-  }
-
-  return {
-    observe(message: any) {
-      trackMessage(message);
-      resetInactivityTimer();
-    },
-    touch() {
-      resetInactivityTimer();
-    },
-    get timedOut() {
-      return timedOut;
-    },
-    get toolsInFlight() {
-      return toolsInFlight;
-    },
-    clear() {
-      clearTimeout(inactivityTimer);
-      clearTimeout(maxTimer);
-    },
-  };
 }
 
 export function createAgentRunner(options: {
@@ -350,20 +189,9 @@ export function createAgentRunner(options: {
   }
 
   /**
-   * Create an activity-based timeout that resets on any SDK activity.
-   *
-   * Tool-aware behavior:
-   *   - While `toolsInFlight === 0`: inactivity fires after `inactivityMs` of silence.
-   *   - While `toolsInFlight > 0`: the effective ceiling becomes `maxMs` (the hard max)
-   *     because a long Bash / MCP / subagent Task call legitimately sits silent for minutes.
-   *     We still reset on every tool_use/tool_result transition so finishing a tool re-checks.
-   *   - `maxMs` is the absolute hard ceiling regardless of state.
-   *
-   * Matching SDK message shapes:
-   *   - `assistant` message with `.message.content[]` containing `{ type: "tool_use", id }`
-   *       → tool started, toolsInFlight++
-   *   - `user` message with `.message.content[]` containing `{ type: "tool_result", tool_use_id }`
-   *       → tool finished, toolsInFlight-- (never below zero)
+   * Production wiring of the shared tool-aware timeout: on timeout, log and
+   * abort the SDK query. The state machine itself lives in activity-timeout.ts
+   * (one implementation, unit-tested directly).
    */
   function createActivityTimeout(
     agentId: string,
@@ -371,131 +199,25 @@ export function createAgentRunner(options: {
     inactivityMs: number,
     maxMs: number,
   ) {
-    const startTime = Date.now();
-    let timedOut = false;
-    let inactivityTimer: ReturnType<typeof setTimeout>;
-    let maxTimer: ReturnType<typeof setTimeout>;
-    let toolsInFlight = 0;
-    const openToolIds = new Set<string>();
-
-    function currentInactivityMs(): number {
-      // While a tool is running, promote the inactivity ceiling up to maxMs so we
-      // don't kill a legitimate long-running Bash/MCP/subagent call.
-      return toolsInFlight > 0 ? maxMs : inactivityMs;
-    }
-
-    function resetInactivityTimer() {
-      clearTimeout(inactivityTimer);
-      const ms = currentInactivityMs();
-      inactivityTimer = setTimeout(() => {
-        timedOut = true;
-        const elapsed = Math.round((Date.now() - startTime) / 1000);
-        log.warn(agentId, `Query timed out after ${elapsed}s of inactivity`, {
-          inactivityMs: ms,
-          elapsed,
-          toolsInFlight,
-        });
-        abortController.abort();
-      }, ms);
-    }
-
-    // Start inactivity timer
-    resetInactivityTimer();
-
-    // Hard ceiling
-    maxTimer = setTimeout(() => {
-      if (!timedOut) {
-        timedOut = true;
-        const elapsed = Math.round((Date.now() - startTime) / 1000);
-        log.warn(agentId, `Query hit max timeout of ${maxMs / 1000}s`, {
-          elapsed,
-          toolsInFlight,
-        });
-        abortController.abort();
-      }
-    }, maxMs);
-
-    /**
-     * Inspect an SDK message and update toolsInFlight.
-     * Returns the delta applied so callers/tests can observe transitions.
-     */
-    function trackMessage(message: any): number {
-      let delta = 0;
-      if (!message || typeof message !== "object") return delta;
-
-      // assistant -> tool_use blocks start tools
-      if (message.type === "assistant" && message.message?.content) {
-        const content = message.message.content;
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            if (block && block.type === "tool_use") {
-              const id = typeof block.id === "string" ? block.id : null;
-              if (id) {
-                if (!openToolIds.has(id)) {
-                  openToolIds.add(id);
-                  toolsInFlight++;
-                  delta++;
-                }
-              } else {
-                // No id — still count it, best effort
-                toolsInFlight++;
-                delta++;
-              }
-            }
-          }
+    return createToolAwareActivityTimeout({
+      inactivityMs,
+      maxMs,
+      onTimeout: (reason, info) => {
+        const elapsed = Math.round(info.elapsedMs / 1000);
+        if (reason === "inactivity") {
+          log.warn(agentId, `Query timed out after ${elapsed}s of inactivity`, {
+            elapsed,
+            toolsInFlight: info.toolsInFlight,
+          });
+        } else {
+          log.warn(agentId, `Query hit max timeout of ${maxMs / 1000}s`, {
+            elapsed,
+            toolsInFlight: info.toolsInFlight,
+          });
         }
-      }
-
-      // user -> tool_result blocks end tools
-      if (message.type === "user" && message.message?.content) {
-        const content = message.message.content;
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            if (block && block.type === "tool_result") {
-              const id = typeof block.tool_use_id === "string" ? block.tool_use_id : null;
-              if (id && openToolIds.has(id)) {
-                openToolIds.delete(id);
-                if (toolsInFlight > 0) {
-                  toolsInFlight--;
-                  delta--;
-                }
-              } else if (toolsInFlight > 0) {
-                // Unknown id but we had something open — decrement best effort
-                toolsInFlight--;
-                delta--;
-              }
-            }
-          }
-        }
-      }
-
-      return delta;
-    }
-
-    return {
-      /** Call on every SDK message to reset the inactivity timer. */
-      touch() {
-        resetInactivityTimer();
+        abortController.abort();
       },
-      /** Inspect an SDK message, update tool-tracking state, and reset the timer. */
-      observe(message: any) {
-        trackMessage(message);
-        resetInactivityTimer();
-      },
-      get timedOut() {
-        return timedOut;
-      },
-      get elapsed() {
-        return Math.round((Date.now() - startTime) / 1000);
-      },
-      get toolsInFlight() {
-        return toolsInFlight;
-      },
-      clear() {
-        clearTimeout(inactivityTimer);
-        clearTimeout(maxTimer);
-      },
-    };
+    });
   }
 
   /**
@@ -541,127 +263,22 @@ export function createAgentRunner(options: {
   }
 
   /**
-   * Non-streaming run — used by scheduler/heartbeats.
-   * Uses activity-based timeout: 3min inactivity, 30min max.
+   * Non-streaming run — used by scheduler/heartbeats, media messages,
+   * broadcasts, and inter-agent messages.
+   *
+   * Thin wrapper over runStreaming with a no-op update callback, so every
+   * caller shares one battle-tested code path: stall retry, stale-session
+   * self-heal, activeQueries registration (drain + interrupt visibility).
+   * Historically this had its own duplicate loop that silently lacked all
+   * three — heartbeat-driven agents could brick on an aged-out session.
    */
   async function run(
     agent: AgentConfig,
     prompt: string,
     runOptions?: { topicId?: number; timeout?: number; priority?: QueryPriority },
   ): Promise<string> {
-    if (isShuttingDown) {
-      throw new Error("Runner is shutting down — not accepting new queries");
-    }
-    const agentKey = getAgentKey(agent.id, runOptions?.topicId);
-    const priority: QueryPriority = runOptions?.priority ?? "high";
-    // High-priority (user-driven) queries get a longer inactivity window because
-    // deep sessions (hundreds of messages) can plausibly sit silent during
-    // cache-cold reasoning. Low-priority (heartbeat/scheduler) stays tighter.
-    const defaultInactivitySec = priority === "high" ? 600 : 420;
-    const inactivityTimeout = (agent.inactivityTimeout ?? defaultInactivitySec) * 1000;
-    const maxTimeout = runOptions?.timeout ?? 1_800_000; // 30 min max
-
-    const prev = agentMutex.get(agentKey) ?? Promise.resolve();
-    let releaseMutex: () => void;
-    const mutexPromise = new Promise<void>((resolve) => {
-      releaseMutex = resolve;
-    });
-    agentMutex.set(agentKey, prev.then(() => mutexPromise));
-
-    await prev;
-
-    try {
-      await semaphore.acquire(priority);
-
-      const queryStart = Date.now();
-      let outcome: "success" | "error" | "timeout" = "success";
-      try {
-        const session = await getSession(agent.id, runOptions?.topicId);
-        const resumeSessionId = session?.sessionId ?? null;
-
-        const opts = buildQueryOptions(agent, resumeSessionId);
-
-        log.info(agent.id, "Starting SDK query", {
-          hasSession: !!resumeSessionId,
-          inactivityTimeout,
-          maxTimeout,
-          priority,
-        });
-
-        const abortController = new AbortController();
-        opts.abortController = abortController;
-
-        const q = query({ prompt, options: opts });
-        const timer = createActivityTimeout(agent.id, abortController, inactivityTimeout, maxTimeout);
-
-        let sessionId: string | null = null;
-        let resultText = "";
-
-        try {
-          for await (const message of q) {
-            timer.observe(message); // Reset inactivity + update tool-in-flight tracking
-
-            if (message.type === "system" && message.subtype === "init") {
-              sessionId = message.session_id;
-            }
-
-            if (message.type === "result") {
-              if ("result" in message) {
-                resultText = message.result ?? "";
-              }
-              if (message.session_id) {
-                sessionId = message.session_id;
-              }
-            }
-          }
-
-          timer.clear();
-
-          if (timer.timedOut) {
-            log.error(agent.id, "SDK query timed out", { elapsed: timer.elapsed });
-            if (sessionId) {
-              await saveSession(agent.id, {
-                sessionId,
-                lastActivity: new Date().toISOString(),
-                lastHeartbeat: session?.lastHeartbeat ?? null,
-                messageCount: session?.messageCount ?? 0,
-              }, runOptions?.topicId);
-            }
-            outcome = "timeout";
-            return "Sorry, the request timed out. Please try again with a simpler question.";
-          }
-
-          await saveSession(agent.id, {
-            sessionId,
-            lastActivity: new Date().toISOString(),
-            lastHeartbeat: session?.lastHeartbeat ?? null,
-            messageCount: (session?.messageCount ?? 0) + 1,
-          }, runOptions?.topicId);
-
-          log.info(agent.id, "SDK query completed", {
-            sessionId: sessionId?.slice(0, 12),
-            messageCount: (session?.messageCount ?? 0) + 1,
-            elapsed: timer.elapsed,
-          });
-
-          return resultText.trim();
-        } catch (err) {
-          timer.clear();
-          outcome = "error";
-          throw err;
-        }
-      } catch (err) {
-        if (outcome === "success") outcome = "error";
-        throw err;
-      } finally {
-        const elapsedSeconds = (Date.now() - queryStart) / 1000;
-        queryDurationSeconds.observe(elapsedSeconds, { agent: agent.id, priority });
-        messagesTotal.inc({ agent: agent.id, priority, outcome });
-        semaphore.release();
-      }
-    } finally {
-      releaseMutex!();
-    }
+    const { text } = await runStreaming(agent, prompt, () => {}, runOptions);
+    return text;
   }
 
   /**
