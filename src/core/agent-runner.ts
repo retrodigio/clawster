@@ -57,8 +57,16 @@ export function createAgentRunner(options: {
    * scripted message sequences instead of a real claude subprocess.
    */
   queryFn?: (args: { prompt: string; options: Options }) => Query;
+  /**
+   * Resolve the `--model` string for a run, based on the agent's current mode
+   * (planning vs implementation) for the given chat/topic. Injected by the
+   * server so the runner stays decoupled from config + mode storage. Omitted
+   * (e.g. in tests) = fall back to the built-in default model.
+   */
+  resolveModel?: (agent: AgentConfig, topicId?: number) => Promise<string> | string;
 }) {
-  const { maxConcurrent, mcpConfigPath } = options;
+  const { maxConcurrent, mcpConfigPath, resolveModel } = options;
+  const DEFAULT_MODEL = "claude-opus-4-8";
   const queryFn = options.queryFn ?? query;
   const semaphore = createSemaphore(maxConcurrent);
   const agentMutex = new Map<string, Promise<void>>();
@@ -97,9 +105,9 @@ export function createAgentRunner(options: {
     return topicId ? `${agentId}-topic-${topicId}` : agentId;
   }
 
-  function buildQueryOptions(agent: AgentConfig, resumeSessionId: string | null): Options {
+  function buildQueryOptions(agent: AgentConfig, resumeSessionId: string | null, model: string = DEFAULT_MODEL): Options {
     const opts: Options = {
-      model: "claude-opus-4-8",
+      model,
       cwd: agent.workspace,
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
@@ -350,6 +358,11 @@ export function createAgentRunner(options: {
 
       const queryStart = Date.now();
       let outcome: "success" | "error" | "timeout" = "success";
+      // Resolve the model once per run (mode is a per-chat setting that won't
+      // change mid-turn), so a retry reuses the same model as the first attempt.
+      const model = resolveModel
+        ? await resolveModel(agent, runOptions?.topicId)
+        : DEFAULT_MODEL;
       const MAX_ATTEMPTS = 2; // one initial + one retry on inactivity timeout
       try {
         // Retry loop: on mid-stream inactivity timeout, resume the saved session
@@ -364,13 +377,14 @@ export function createAgentRunner(options: {
           ? (session?.sessionId ?? null)
           : (interruptedSessionId ?? session?.sessionId ?? null);
 
-        const opts = buildQueryOptions(agent, resumeSessionId);
+        const opts = buildQueryOptions(agent, resumeSessionId, model);
 
         log.info(agent.id, "Starting SDK streaming query", {
           hasSession: !!resumeSessionId,
           interrupted: !!interruptedSessionId && !isRetry,
           retry: isRetry,
           attempt: attemptNo,
+          model,
           inactivityTimeout,
           maxTimeout,
           priority,

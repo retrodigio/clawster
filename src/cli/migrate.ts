@@ -4,7 +4,7 @@ import { existsSync } from "fs";
 import { mkdir } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
-import { getClawsterHome, saveConfig, saveAgents, saveEnvVar, getEnvFilePath } from "../core/config.ts";
+import { getClawsterHome, saveConfig, saveAgents, saveEnvVar, getEnvFilePath, DEFAULT_MODELS } from "../core/config.ts";
 import type { ClawsterConfig, AgentsConfig } from "../core/config.ts";
 
 interface OldConfig {
@@ -105,6 +105,7 @@ export const migrateCommand = new Command("migrate")
       claudePath: oldConfig.claudePath || "claude",
       healthPort: 18800,
       maxConcurrent: oldConfig.maxGlobalConcurrent || 4,
+      models: { ...DEFAULT_MODELS },
     };
 
     await saveConfig(config);

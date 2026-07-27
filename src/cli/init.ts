@@ -4,7 +4,7 @@ import { existsSync } from "fs";
 import { mkdir, copyFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
-import { getClawsterHome, saveConfig, saveAgents, saveEnvVar, getEnvFilePath } from "../core/config.ts";
+import { getClawsterHome, saveConfig, saveAgents, saveEnvVar, getEnvFilePath, DEFAULT_MODELS } from "../core/config.ts";
 import type { ClawsterConfig, AgentsConfig } from "../core/config.ts";
 
 function ask(question: string, defaultValue?: string): Promise<string> {
@@ -194,6 +194,7 @@ export const initCommand = new Command("init")
       claudePath: "claude",
       healthPort: 18800,
       maxConcurrent: 4,
+      models: { ...DEFAULT_MODELS },
       ...(groqKey ? { groqKey } : {}),
     };
     await saveConfig(config);

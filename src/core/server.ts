@@ -10,6 +10,7 @@ import { log } from "./logger.ts";
 import { startWebApi } from "./web-api.ts";
 import { startScheduler } from "./scheduler.ts";
 import { walPending, walDone } from "./message-wal.ts";
+import { resolveAgentModel } from "./model-resolver.ts";
 
 export async function startServer() {
   const lockAcquired = await acquireLock();
@@ -50,6 +51,7 @@ export async function startServer() {
   const runner = createAgentRunner({
     maxConcurrent: config.maxConcurrent,
     mcpConfigPath,
+    resolveModel: resolveAgentModel,
   });
 
   const bot = createBot({

@@ -4,7 +4,7 @@ import { readFile, writeFile, mkdir, chmod, rename } from "fs/promises";
 import { existsSync } from "fs";
 import { z } from "zod";
 import { log } from "./logger.ts";
-import type { AgentConfig } from "./types.ts";
+import type { AgentConfig, ModelsConfig } from "./types.ts";
 
 export function getClawsterHome(): string {
   return process.env.CLAWSTER_HOME || join(homedir(), ".clawster");
@@ -71,6 +71,27 @@ export async function saveEnvVar(key: string, value: string): Promise<void> {
 
 // --- Zod Schemas ---
 
+// Model per mode.
+//   conversation   -> opus            (front-facing orchestrator chat)
+//   planning       -> claude-fable-5  (deep reasoning / plan authoring)
+//   implementation -> sonnet          (agentic coding / subagent work)
+// NOTE: `opus` and `sonnet` are CLI aliases and refresh automatically. `fable`
+// is pinned to its full model ID because SDK 0.2.x does not recognize the
+// `fable` alias — it will pass validation on the CLI but fail through the SDK
+// path with "issue with the selected model (fable)". Upgrade to SDK 0.3.x or
+// later before switching this back to the bare alias.
+export const DEFAULT_MODELS = {
+  conversation: "opus",
+  planning: "claude-fable-5",
+  implementation: "sonnet",
+} as const;
+
+export const ModelsConfigSchema = z.object({
+  conversation: z.string().default(DEFAULT_MODELS.conversation),
+  planning: z.string().default(DEFAULT_MODELS.planning),
+  implementation: z.string().default(DEFAULT_MODELS.implementation),
+});
+
 export const ClawsterConfigSchema = z.object({
   botToken: z.string().min(1, "Bot token is required — set CLAWSTER_BOT_TOKEN in the environment or add CLAWSTER_BOT_TOKEN=... to ~/.clawster/env"),
   allowedUserId: z.string().min(1, "Allowed user ID is required"),
@@ -79,6 +100,7 @@ export const ClawsterConfigSchema = z.object({
   healthPort: z.number().int().min(1024).max(65535).default(18800),
   maxConcurrent: z.number().int().min(1).max(20).default(4),
   groqKey: z.string().optional(),
+  models: ModelsConfigSchema.default(DEFAULT_MODELS),
 });
 
 export const HeartbeatSchema = z.object({
@@ -114,6 +136,14 @@ export const AgentSchema = z.object({
   // Per-agent allowlist for MCP servers marked `restricted: true` in
   // config/mcp-servers.json. See AgentConfig.mcpServers for rationale.
   mcpServers: z.array(z.string()).optional(),
+  // Model-mode overrides. defaultMode sets which mode a fresh chat starts in;
+  // models overrides the fleet-wide model mapping for this agent only.
+  defaultMode: z.enum(["conversation", "planning", "implementation"]).optional(),
+  models: z.object({
+    conversation: z.string().optional(),
+    planning: z.string().optional(),
+    implementation: z.string().optional(),
+  }).optional(),
 });
 
 export const AgentsConfigSchema = z.object({
@@ -169,6 +199,7 @@ export interface ClawsterConfig {
   healthPort: number;
   maxConcurrent: number;
   groqKey?: string;
+  models: ModelsConfig;
 }
 
 export interface AgentsConfig {

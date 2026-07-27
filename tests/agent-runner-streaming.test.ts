@@ -228,4 +228,47 @@ describe("runStreaming (mock SDK)", () => {
     const out = await runner.runStreaming(agent, "stream it", () => {});
     expect(out.text).toBe("partial answer");
   });
+
+  test("uses the built-in default model when no resolveModel is provided", async () => {
+    const q = fakeQuery([{ messages: [init("s1"), result("ok", "s1")] }]);
+    const runner = makeRunner(q);
+    await runner.runStreaming(agent, "hi", () => {});
+    expect(q.calls[0]!.options.model).toBe("claude-opus-4-8");
+  });
+
+  test("threads resolveModel's return value into the query options", async () => {
+    const q = fakeQuery([{ messages: [init("s1"), result("ok", "s1")] }]);
+    const seen: Array<{ agentId: string; topicId?: number }> = [];
+    const runner = createAgentRunner({
+      maxConcurrent: 2,
+      mcpConfigPath: "",
+      queryFn: q,
+      resolveModel: (a, topicId) => {
+        seen.push({ agentId: a.id, topicId });
+        return "fable";
+      },
+    });
+    await runner.runStreaming(agent, "plan this", () => {}, { topicId: 7 });
+    expect(q.calls[0]!.options.model).toBe("fable");
+    expect(seen).toEqual([{ agentId: "tester", topicId: 7 }]);
+  });
+
+  test("resolves the model once and reuses it across a stall retry", async () => {
+    const q = fakeQuery([
+      { messages: [init("s1")], hang: true },       // attempt 1 stalls
+      { messages: [init("s1"), result("done", "s1")] }, // attempt 2 succeeds
+    ]);
+    let calls = 0;
+    const runner = createAgentRunner({
+      maxConcurrent: 2,
+      mcpConfigPath: "",
+      queryFn: q,
+      resolveModel: () => `sonnet-${++calls}`,
+    });
+    const out = await runner.runStreaming(agent, "slow", () => {});
+    expect(out.text).toBe("done");
+    expect(calls).toBe(1); // resolved once, not per attempt
+    expect(q.calls[0]!.options.model).toBe("sonnet-1");
+    expect(q.calls[1]!.options.model).toBe("sonnet-1");
+  });
 });
