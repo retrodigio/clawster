@@ -101,6 +101,47 @@ export const ClawsterConfigSchema = z.object({
   maxConcurrent: z.number().int().min(1).max(20).default(4),
   groqKey: z.string().optional(),
   models: ModelsConfigSchema.default(DEFAULT_MODELS),
+
+  /**
+   * How the daemon runs.
+   *
+   *   "bot"          — the daemon polls Telegram itself and dispatches to
+   *                    per-agent `claude -p` runs. The original arrangement,
+   *                    and still the default so existing installs are untouched.
+   *
+   *   "orchestrator" — the daemon does NOT poll Telegram. A live Claude Code
+   *                    orchestrator session owns the bot connection (via the
+   *                    telegram-channel plugin) and the daemon supervises it.
+   *
+   * The two cannot both poll: Telegram permits one getUpdates consumer per bot
+   * token. Note that SENDING is unaffected — the scheduler posts heartbeats over
+   * plain HTTP sendMessage, which does not conflict with anyone's polling, so
+   * heartbeats keep working in either mode.
+   */
+  mode: z.enum(["bot", "orchestrator"]).default("bot"),
+
+  // NOTE: the outer .default() is spelled out in full rather than `{}`. Zod does
+  // not re-parse a default value through the inner schema, so `.default({})`
+  // yields a literal `{}` and every field comes back undefined — which would
+  // have had the supervisor hunting for a tmux session named "undefined".
+  orchestrator: z.object({
+    /** tmux session holding the orchestrator. */
+    tmuxSession: z.string().default("orchestrator"),
+    /** Working directory whose CLAUDE.md defines the dispatcher. Empty = supervisor default. */
+    cwd: z.string().default(""),
+    /** Channel plugin state dir (dispatcher.health, plugin.lock live here). Empty = default. */
+    stateDir: z.string().default(""),
+    /** MCP server name loaded as a channel. */
+    channelServer: z.string().default("telegram-channel"),
+    /** Supervision poll interval. */
+    pollSeconds: z.number().int().min(5).max(600).default(30),
+  }).default({
+    tmuxSession: "orchestrator",
+    cwd: "",
+    stateDir: "",
+    channelServer: "telegram-channel",
+    pollSeconds: 30,
+  }),
 });
 
 export const HeartbeatSchema = z.object({
@@ -191,6 +232,15 @@ function formatZodError(error: z.ZodError): string {
 
 // --- Existing Interfaces (preserved for backwards compatibility) ---
 
+export interface OrchestratorConfig {
+  tmuxSession: string;
+  /** Empty string means "use the supervisor's default". */
+  cwd: string;
+  stateDir: string;
+  channelServer: string;
+  pollSeconds: number;
+}
+
 export interface ClawsterConfig {
   botToken: string;
   allowedUserId: string;
@@ -200,6 +250,9 @@ export interface ClawsterConfig {
   maxConcurrent: number;
   groqKey?: string;
   models: ModelsConfig;
+  /** "bot" (default, unchanged behaviour) or "orchestrator". */
+  mode: "bot" | "orchestrator";
+  orchestrator: OrchestratorConfig;
 }
 
 export interface AgentsConfig {

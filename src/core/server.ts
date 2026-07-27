@@ -11,6 +11,7 @@ import { startWebApi } from "./web-api.ts";
 import { startScheduler } from "./scheduler.ts";
 import { walPending, walDone } from "./message-wal.ts";
 import { resolveAgentModel } from "./model-resolver.ts";
+import { OrchestratorSupervisor } from "./orchestrator-supervisor.ts";
 
 export async function startServer() {
   const lockAcquired = await acquireLock();
@@ -54,21 +55,34 @@ export async function startServer() {
     resolveModel: resolveAgentModel,
   });
 
-  const bot = createBot({
-    botToken: config.botToken,
-    allowedUserId: config.allowedUserId,
-    groqKey: config.groqKey,
-    resolveAgent: resolveAgentFn,
-    runner,
-    agentById,
-  });
+  const orchestratorMode = config.mode === "orchestrator";
 
   const maskedToken = config.botToken.slice(0, 6) + "..." + config.botToken.slice(-4);
   log.info("orchestrator", "Starting orchestrator", {
     agents: agentById.size,
     botToken: maskedToken,
     allowedUserId: config.allowedUserId,
+    mode: config.mode,
   });
+
+  // In orchestrator mode the daemon must NOT poll Telegram — a live Claude Code
+  // session owns the bot connection through the telegram-channel plugin, and
+  // Telegram permits exactly one getUpdates consumer per token. Two pollers give
+  // 409s and unpredictable delivery.
+  //
+  // Sending is unaffected: the scheduler posts heartbeats over plain HTTP
+  // sendMessage, which conflicts with nobody's polling. Heartbeats keep working
+  // in both modes.
+  const bot = orchestratorMode
+    ? undefined
+    : createBot({
+        botToken: config.botToken,
+        allowedUserId: config.allowedUserId,
+        groqKey: config.groqKey,
+        resolveAgent: resolveAgentFn,
+        runner,
+        agentById,
+      });
 
   // Use @grammyjs/runner instead of bot.start() — the default sequentializes
   // update handlers, which means a slow Claude subprocess for one agent blocks
@@ -76,14 +90,21 @@ export async function startServer() {
   // update concurrently so a long-running reply in chat A can't starve chat B.
   // Concurrency of actual `claude -p` subprocesses remains bounded by the
   // runner's internal priority-aware semaphore (maxConcurrent).
-  await bot.init();
-  log.info("orchestrator", "Bot is running!");
-  const botHandle: RunnerHandle = run(bot);
+  let botHandle: RunnerHandle | undefined;
+  if (bot) {
+    await bot.init();
+    log.info("orchestrator", "Bot is running!");
+    botHandle = run(bot);
+  } else {
+    log.info("orchestrator", "Orchestrator mode — not polling Telegram; " +
+      "a supervised Claude Code session owns the bot connection");
+  }
 
   // Report messages orphaned by a mid-processing restart (WAL entries that
   // never got their reply). Without this, a crash between Telegram's ack and
   // our reply loses the message with zero trace.
   (async () => {
+    if (!bot) return; // no bot to notify through in orchestrator mode
     const orphans = await walPending();
     for (const orphan of orphans) {
       try {
@@ -117,6 +138,36 @@ export async function startServer() {
   // and task changes take effect without a restart.
   startScheduler(() => getConfig().agents.agents, runner, config.botToken, config.timezone);
 
+  // Supervision: keep the live orchestrator session alive. Only meaningful in
+  // orchestrator mode — in bot mode there is no session to supervise.
+  let supervisorTimer: ReturnType<typeof setInterval> | undefined;
+  if (orchestratorMode) {
+    const o = config.orchestrator;
+    const supervisor = new OrchestratorSupervisor({
+      tmuxSession: o.tmuxSession,
+      channelServer: o.channelServer,
+      ...(o.cwd ? { cwd: o.cwd } : {}),
+      ...(o.stateDir ? { stateDir: o.stateDir } : {}),
+    });
+    const tick = () =>
+      supervisor
+        .tick()
+        .then((result) => {
+          // Only log when something happened — a healthy tick every 30s would
+          // drown the log and hide the interesting ones.
+          if (!result.startsWith("none:")) {
+            log.warn("supervisor", "supervision action", { result });
+          }
+        })
+        .catch((err) => log.error("supervisor", "tick failed", { error: String(err) }));
+    void tick();
+    supervisorTimer = setInterval(tick, o.pollSeconds * 1000);
+    log.info("supervisor", "Supervising orchestrator session", {
+      tmuxSession: o.tmuxSession,
+      everySeconds: o.pollSeconds,
+    });
+  }
+
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return; // second signal while draining — ignore
@@ -125,15 +176,19 @@ export async function startServer() {
 
     // 1. Stop accepting new Telegram messages
     try {
-      await botHandle.stop();
+      await botHandle?.stop();
     } catch (err) {
       log.warn("orchestrator", "Bot handle stop error (non-fatal)", { error: String(err) });
     }
 
-    // 2. Signal the runner to reject new queries
+    // 2. Stop supervising before draining — otherwise a shutting-down daemon
+    //    could observe the orchestrator and "helpfully" restart it on the way out.
+    if (supervisorTimer) clearInterval(supervisorTimer);
+
+    // 3. Signal the runner to reject new queries
     runner.shutdown();
 
-    // 3. Wait for in-flight queries to complete (max 30s)
+    // 4. Wait for in-flight queries to complete (max 30s)
     const drainTimeout = 30_000;
     try {
       await runner.drain(drainTimeout);
