@@ -73,6 +73,17 @@ export class OrchestratorSupervisor {
    * that actually happens: an unexpected death, not a restart we chose.
    */
   private lastAlive?: SessionObservation;
+  /**
+   * The `claude` version the running session was started on.
+   *
+   * Claude Code's auto-updater installs a new version directory and repoints
+   * the launcher, but it cannot hot-swap the binary of a live process — so a
+   * long-lived orchestrator keeps whatever version it booted with, forever.
+   * At the observed release cadence (four versions in nine days) a week-old
+   * session is several versions behind, and the same is true of its CLAUDE.md,
+   * which is also read only at startup.
+   */
+  private runningVersion?: string;
   private readonly opts: Required<Pick<OrchestratorSupervisorOptions, "exec" | "now">> &
     OrchestratorSupervisorOptions;
 
@@ -221,6 +232,73 @@ export class OrchestratorSupervisor {
    *    is the plugin's own lock file, which it writes on startup — so we wait
    *    for that and return false if it never appears.
    */
+  /** `claude --version` of the installed launcher, e.g. "2.1.220". */
+  async installedVersion(): Promise<string | undefined> {
+    try {
+      const r = await this.opts.exec(["claude", "--version"]);
+      if (r.code !== 0) return undefined;
+      return r.stdout.trim().split(/\s+/)[0];
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * True when a newer Claude Code is installed than the one the session is
+   * running. Restarting on this is safe now that restarts write a recovery
+   * manifest and successors read their predecessor's transcript — but it is
+   * still only worth doing while the orchestrator is idle.
+   */
+  async isStale(): Promise<{ stale: boolean; running?: string; installed?: string }> {
+    const installed = await this.installedVersion();
+    const running = this.runningVersion;
+    return {
+      stale: !!(running && installed && running !== installed),
+      running,
+      installed,
+    };
+  }
+
+  /**
+   * Ask the orchestrator to prove it is still processing.
+   *
+   * Writes a nonce the plugin turns into a real channel event; the session
+   * answers by calling probe_ack. This exercises the exact path a wedge breaks
+   * -- receive an event, act on it -- rather than asking whether a process
+   * exists, which tmux already answered.
+   *
+   * Returns true only on a matching nonce within the window. A stale response
+   * from an earlier probe must never read as liveness.
+   */
+  async probe(timeoutMs = 60_000): Promise<boolean> {
+    const nonce = `${this.opts.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const reqPath = join(this.opts.stateDir, "probe.request");
+    const resPath = join(this.opts.stateDir, "probe.response");
+    try {
+      // Clear any prior answer so we cannot mistake it for this one.
+      if (existsSync(resPath)) writeFileSync(resPath, "{}");
+      writeFileSync(reqPath, JSON.stringify({ nonce, at: this.opts.now() }));
+    } catch (e) {
+      log.warn("supervisor", "could not write probe request", { error: String(e) });
+      return false;
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 2000));
+      try {
+        if (!existsSync(resPath)) continue;
+        const res = JSON.parse(readFileSync(resPath, "utf8")) as { nonce?: string };
+        if (res.nonce === nonce) {
+          log.info("supervisor", "probe acknowledged — orchestrator is alive", { nonce });
+          return true;
+        }
+      } catch { /* keep waiting */ }
+    }
+    log.warn("supervisor", "probe went unanswered — wedge confirmed", { nonce, timeoutMs });
+    return false;
+  }
+
   async startOrchestrator(timeoutMs = 45_000): Promise<boolean> {
     const cmd = [
       "tmux", "new-session", "-d", "-s", this.opts.tmuxSession,
@@ -240,8 +318,11 @@ export class OrchestratorSupervisor {
     while (Date.now() < deadline) {
       await new Promise(res => setTimeout(res, 3000));
       if (existsSync(lockFile)) {
+        // Record what we booted on, so staleness is a comparison rather than a guess.
+        this.runningVersion = await this.installedVersion();
         log.info("supervisor", "orchestrator up — channel plugin holding its lock", {
           session: this.opts.tmuxSession, confirmations: enters,
+          version: this.runningVersion,
         });
         return true;
       }
@@ -279,15 +360,49 @@ export class OrchestratorSupervisor {
     this.state = state;
 
     switch (action.kind) {
-      case "none":
+      case "none": {
+        // Idle and running an outdated Claude Code (or a stale CLAUDE.md, which
+        // is also read only at startup) — take the free restart. Only when
+        // genuinely idle: a restart mid-conversation costs live subagents, and
+        // being one version behind is never worth that.
+        const idle = !health || (health.pendingEvents ?? 0) === 0;
+        if (idle && session.alive && session.status !== "busy") {
+          const v = await this.isStale();
+          if (v.stale) {
+            log.warn("supervisor", "restarting for a newer Claude Code", {
+              running: v.running, installed: v.installed,
+            });
+            this.writeRecoveryManifest(
+              `version upgrade ${v.running} -> ${v.installed}`,
+              session.sessionId ? session : (this.lastAlive ?? session),
+            );
+            await this.stopOrchestrator();
+            const ok = await this.startOrchestrator();
+            return `upgrade(${ok ? "verified" : "FAILED"}): ${v.running} -> ${v.installed}`;
+          }
+        }
         return `none: ${action.reason}`;
+      }
 
-      case "probe":
-        // The probe itself is the orchestrator's job — we cannot inject a
-        // channel event from here without a real chat. Logging it surfaces the
-        // suspicion without paying the cost of a restart.
+      case "probe": {
         log.warn("supervisor", "orchestrator looks wedged — probing", { reason: action.reason });
-        return `probe: ${action.reason}`;
+        const alive = await this.probe();
+        if (alive) {
+          // It answered, so it was never wedged. Clear the suspicion rather
+          // than letting readings accumulate toward a needless restart.
+          this.state = initialState();
+          return `probe: answered — not wedged, suspicion cleared`;
+        }
+        // Confirmed. Restart now rather than waiting another tick: we have
+        // positive evidence, and every further tick is more dead air.
+        this.writeRecoveryManifest(
+          `wedged: ${action.reason}`,
+          session.sessionId ? session : (this.lastAlive ?? session),
+        );
+        await this.stopOrchestrator();
+        const ok = await this.startOrchestrator();
+        return `restart(${ok ? "verified" : "FAILED"}): wedge confirmed by unanswered probe`;
+      }
 
       case "start": {
         log.warn("supervisor", "orchestrator is down — starting", { reason: action.reason });
