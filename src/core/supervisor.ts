@@ -63,7 +63,22 @@ export const DEFAULT_SUPERVISOR_CONFIG: SupervisorConfig = {
   wedgeTimeoutMs: 180_000,
   wedgeReadingsRequired: 2,
   healthStaleMs: 120_000,
-  backoffMs: [60_000, 300_000, 900_000, 3_600_000],
+  // 30s → 2m → 5m → 15m.
+  //
+  // Softened from [1m, 5m, 15m, 1h] after watching it in practice. The ladder
+  // exists to stop a crash loop from orphaning subagents faster than a visible
+  // outage would — but the supervisor cannot distinguish a loop from two
+  // unrelated failures an hour apart, and the steeper ladder punished the
+  // second case with five minutes of the whole fleet being deaf.
+  //
+  // The circuit breaker is the real protection against a genuine loop; the
+  // backoff only needs to keep restarts from stampeding. Erring toward
+  // availability is the better trade for a single-operator fleet.
+  //
+  // Note the 15m rung is unreachable while maxRestarts is 3 — the breaker trips
+  // first, so only 30s/2m/5m are ever used. It is kept so raising maxRestarts
+  // does not silently fall off the end of the ladder.
+  backoffMs: [30_000, 120_000, 300_000, 900_000],
   maxRestarts: 3,
   circuitWindowMs: 1_800_000,
 };
