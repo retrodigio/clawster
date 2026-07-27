@@ -63,6 +63,16 @@ export function defaultOptions(): OrchestratorSupervisorOptions {
 
 export class OrchestratorSupervisor {
   private state: SupervisorState = initialState();
+  /**
+   * Last session we saw alive.
+   *
+   * A crashed session vanishes from `claude agents --json`, so by the time we
+   * notice it is gone its UUID is unrecoverable — and that UUID is exactly what
+   * a successor needs to find the orphaned subagents. Remembering it while the
+   * session is healthy is the only way to write a useful manifest for the case
+   * that actually happens: an unexpected death, not a restart we chose.
+   */
+  private lastAlive?: SessionObservation;
   private readonly opts: Required<Pick<OrchestratorSupervisorOptions, "exec" | "now">> &
     OrchestratorSupervisorOptions;
 
@@ -137,7 +147,9 @@ export class OrchestratorSupervisor {
       // orchestrator is dead — tmux already answered that question.
     }
 
-    return { alive: true, sessionId, pid, status };
+    const obs: SessionObservation = { alive: true, sessionId, pid, status };
+    if (sessionId) this.lastAlive = obs;
+    return obs;
   }
 
   private projectHash(): string {
@@ -279,12 +291,18 @@ export class OrchestratorSupervisor {
 
       case "start": {
         log.warn("supervisor", "orchestrator is down — starting", { reason: action.reason });
+        // Use the last session we saw alive: the dead one is no longer
+        // enumerable, and its UUID is what makes its subagents findable.
+        if (this.lastAlive) {
+          this.writeRecoveryManifest(`died: ${action.reason}`, this.lastAlive);
+          this.lastAlive = undefined;
+        }
         const ok = await this.startOrchestrator();
         return `start(${ok ? "verified" : "FAILED"}): ${action.reason}`;
       }
 
       case "restart": {
-        this.writeRecoveryManifest(action.reason, session);
+        this.writeRecoveryManifest(action.reason, session.sessionId ? session : (this.lastAlive ?? session));
         await this.stopOrchestrator();
         const ok = await this.startOrchestrator();
         return `restart(${ok ? "verified" : "FAILED"}): ${action.reason}`;
