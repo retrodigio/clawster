@@ -2,6 +2,23 @@ export interface TopicConfig {
   name: string;
 }
 
+/**
+ * Which model tier an agent (or topic) is currently using:
+ *  - "conversation"   — front-facing chat with the user (Opus); the orchestrator tier
+ *  - "planning"       — deep reasoning / analysis / plan authoring (Fable)
+ *  - "implementation" — agentic coding / executing a plan (Sonnet)
+ * The concrete model string for each mode lives in ClawsterConfig.models,
+ * with an optional per-agent override in AgentConfig.models.
+ */
+export type AgentMode = "conversation" | "planning" | "implementation";
+
+/** Maps each mode to a `--model` value the SDK accepts (alias or full ID). */
+export interface ModelsConfig {
+  conversation: string;
+  planning: string;
+  implementation: string;
+}
+
 export interface HeartbeatConfig {
   every: string;
   activeHours?: { start: string; end: string };
@@ -37,6 +54,17 @@ export interface AgentConfig {
    * them here. Undefined or empty array = no restricted servers granted.
    */
   mcpServers?: string[];
+  /**
+   * Default mode this agent starts in when no per-chat mode has been set via
+   * /plan, /build, or /convo. Falls back to "conversation" when omitted.
+   */
+  defaultMode?: AgentMode;
+  /**
+   * Per-agent override of the fleet-wide ClawsterConfig.models mapping. Merged
+   * over the global map, so an agent can pin (say) a different planning model
+   * without redefining implementation. Omitted = use the fleet defaults.
+   */
+  models?: Partial<ModelsConfig>;
 }
 
 export interface OrchestratorConfig {

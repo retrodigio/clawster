@@ -107,9 +107,18 @@ All config lives at `~/.clawster/` (or `$CLAWSTER_HOME`).
   "timezone": "America/Denver",
   "claudePath": "claude",
   "healthPort": 18800,
-  "maxConcurrent": 4
+  "maxConcurrent": 4,
+  "models": {
+    "conversation": "opus",
+    "planning": "fable",
+    "implementation": "sonnet"
+  }
 }
 ```
+
+`models` maps each **mode** to a `--model` value the Claude CLI accepts (line
+aliases like `fable`/`sonnet`/`opus`, or full IDs like `claude-fable-5`). See
+"Model Modes" below.
 
 ### ~/.clawster/env (secrets)
 
@@ -226,6 +235,42 @@ Agents with a `heartbeat` config proactively check in on their project. The hear
 4. If the agent has something to report, it sends a Telegram message
 5. If nothing notable, the agent responds `NO_CHECKIN` and stays silent
 6. Initial ticks are staggered randomly (0-60s) to avoid thundering herd
+
+## Model Modes (three-tier hierarchy)
+
+Every chat (and every forum topic) runs in one of three **modes**, each mapped to
+a model in `config.json` → `models`:
+
+| Mode | Default model | Use for |
+|---|---|---|
+| `conversation` | `opus` | Front-facing orchestrator chat — the default tier |
+| `planning` | `fable` | Deep reasoning, codebase analysis, authoring implementation plans |
+| `implementation` | `sonnet` | Agentic coding — executing a plan, background subagents |
+
+**Switching (per chat/topic, from Telegram):**
+
+| Command | Effect |
+|---|---|
+| `/convo` | Switch this chat to conversation mode (Opus — default) |
+| `/plan` | Switch this chat to planning mode (Fable — deep reasoning) |
+| `/fable` | Alias for `/plan` |
+| `/build` | Switch this chat to implementation mode (Sonnet — coding) |
+| `/mode` | Show the current mode; `/mode convo` / `/mode plan` / `/mode build` also set it |
+| `/status` | Reports the active mode + resolved model |
+
+**How resolution works** (`src/core/model-resolver.ts`): the effective mode is
+the per-chat value set via `/convo`/`/plan`/`/build` (persisted in `~/.clawster/modes/`,
+survives restarts), falling back to the agent's `defaultMode`, then to
+`conversation`. The model string is `config.models[mode]`, with an optional
+per-agent `models` override merged on top. The runner resolves the model once
+per run (a stall-retry reuses the same model). When no resolver is wired (tests),
+it falls back to the built-in default `claude-opus-4-8`.
+
+**Per-agent overrides** (`agents.json`): an agent may set `defaultMode`
+(`"conversation"` | `"planning"` | `"implementation"`) and/or `models` (partial
+override of the fleet map, e.g. `{ "implementation": "sonnet" }`). Set
+`defaultMode: "implementation"` on agents that only run background/scheduled work
+(no conversational Telegram presence) to keep heartbeats on Sonnet.
 
 ## Open Brain Memory Integration
 
