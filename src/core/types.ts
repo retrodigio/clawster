@@ -1,5 +1,18 @@
 export interface TopicConfig {
   name: string;
+  /** Override the agent's workspace for this topic. */
+  workspace?: string;
+  /** Override the agent's knowledge base for this topic. */
+  kb?: string;
+  /**
+   * This topic is not project work — the orchestrator skips the KB briefing.
+   *
+   * Zero Topics carries "Personal growth" and "Housing" beside "Clawster". All
+   * route to the same agent, so without this a personal conversation would be
+   * told to read kb-clawster before responding: a wasted turn, and a context
+   * window filled with orchestrator internals it will never use.
+   */
+  noKb?: boolean;
 }
 
 /**

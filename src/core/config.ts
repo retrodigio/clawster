@@ -169,7 +169,20 @@ export const AgentSchema = z.object({
   workspace: z.string().min(1),
   telegramChatId: z.string(),
   isDefault: z.boolean().optional(),
-  topics: z.record(z.string(), z.object({ name: z.string() })).optional(),
+  // Per-topic settings. workspace/kb override the agent's for that topic;
+  // noKb marks a topic as not project work, so the orchestrator skips the
+  // KB briefing entirely.
+  //
+  // These MUST be in the schema, not just in agents.json: zod strips unknown
+  // keys, and saveAgents() writes the parsed result back — so an unmodelled
+  // field survives on disk only until the next write (a web-API edit, topic
+  // registration, discovery) silently deletes it.
+  topics: z.record(z.string(), z.object({
+    name: z.string(),
+    workspace: z.string().optional(),
+    kb: z.string().optional(),
+    noKb: z.boolean().optional(),
+  })).optional(),
   heartbeat: HeartbeatSchema.optional(),
   tasks: z.array(TaskSchema).optional(),
   inactivityTimeout: z.number().optional(),
