@@ -663,6 +663,7 @@ export function startWebApi(options: WebApiOptions) {
           const text = await runner.run(agent, promptText, {
             topicId: body.topicId,
             priority: "high",
+            ...(body.timeoutMs ? { timeout: body.timeoutMs } : {}),
           });
           log.info("web-api", `Sync message to ${id} completed`, { from: body.from });
           return withCors(json({ ok: true, to: id, text }));

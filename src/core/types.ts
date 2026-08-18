@@ -46,6 +46,15 @@ export interface TaskConfig {
   telegramChatId?: string; // Override: send output to this chat (defaults to agent's chat)
   topicId?: number;       // Optional: send to specific forum topic within the group
   enabled?: boolean;      // Default true. Set false to disable without removing.
+  /**
+   * Wall-clock budget for this task's run. Defaults to 10 minutes.
+   *
+   * A shallow `check` finishes in seconds; a deep `assess` on a rich project
+   * does not. The first IronRod assessment reconciled its entire knowledge base
+   * and then lost its summary to a 5-minute cap — the durable work landed and
+   * the message did not, which is the wrong half to lose.
+   */
+  timeoutMs?: number;
 }
 
 export interface AgentConfig {

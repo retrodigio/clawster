@@ -187,7 +187,7 @@ export function startScheduler(
           // sessionScope keeps scheduled runs in their own session so they
           // never advance the user's conversation pointer.
           const response = await runner.run(agent, task.prompt, {
-            timeout: 600_000,
+            timeout: task.timeoutMs ?? 600_000,
             priority: "low",
             sessionScope: "scheduled",
           });
