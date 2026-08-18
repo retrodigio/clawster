@@ -161,6 +161,11 @@ export const TaskSchema = z.object({
   telegramChatId: z.string().optional(),
   topicId: z.number().optional(),
   enabled: z.boolean().default(true),
+  // Wall-clock budget for this task's run. Defaults to 10 minutes, which suits
+  // a shallow `check`. A deep `assess` on a rich project needs far more — the
+  // first IronRod assessment reconciled its whole KB and then lost its summary
+  // to a 5-minute cap, so the durable work landed and the message did not.
+  timeoutMs: z.number().int().min(60_000).max(3_600_000).optional(),
 });
 
 export const AgentSchema = z.object({
