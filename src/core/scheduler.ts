@@ -3,13 +3,102 @@ import { matchesCron, getNextMatch } from "./cron.ts";
 import type { AgentConfig, TaskConfig } from "./types.ts";
 import { appendOutbound, readRecentOutbound, formatJournalForPrompt } from "./outbound-journal.ts";
 
+type RunOpts = { timeout?: number; priority?: "high" | "low"; sessionScope?: string };
+
 type Runner = {
-  run(
+  run(agent: AgentConfig, prompt: string, opts?: RunOpts): Promise<string>;
+  runStructured?(
     agent: AgentConfig,
     prompt: string,
-    opts?: { timeout?: number; priority?: "high" | "low"; sessionScope?: string },
-  ): Promise<string>;
+    outputFormat: unknown,
+    opts?: RunOpts,
+  ): Promise<{ text: string; structured?: unknown }>;
 };
+
+/**
+ * What a scheduled wake returns.
+ *
+ * `checkin` is the whole point: the decision to speak becomes a boolean field
+ * the model fills, not a sentinel string a caller has to find in prose. The
+ * old contract — "respond with exactly NO_CHECKIN" — failed open. Any agent
+ * that prefixed a word, explained itself, or wrapped the token in a sentence
+ * had its narration posted to Telegram as a check-in.
+ */
+export const CHECKIN_SCHEMA = {
+  type: "json_schema" as const,
+  schema: {
+    type: "object",
+    properties: {
+      checkin: {
+        type: "boolean",
+        description:
+          "true only if there is something worth interrupting Chris for. false when nothing notable happened — silence is the correct and expected outcome for most wakes.",
+      },
+      message: {
+        type: "string",
+        description:
+          "The Telegram message to send. Required when checkin is true; omit it entirely when checkin is false.",
+      },
+    },
+    required: ["checkin"],
+    additionalProperties: false,
+  },
+};
+
+/**
+ * Decide whether a wake's output should reach Telegram.
+ *
+ * Three layers, most trustworthy first, because a scheduled run can fail in
+ * ways that leave any single layer blind:
+ *
+ *   1. The parsed schema object — what we asked for.
+ *   2. JSON in the text — the model conformed but the SDK didn't surface it.
+ *   3. The legacy sentinel — a task whose prompt predates the schema.
+ *
+ * Every ambiguous case resolves to silence. A wrongly-silent wake costs one
+ * missed check-in; a wrongly-sent one posts raw JSON or an error string into a
+ * family group chat.
+ */
+export function interpretCheckin(
+  text: string,
+  structured?: unknown,
+): { send: boolean; message?: string; via: "schema" | "json" | "sentinel" } {
+  const fromObject = (
+    obj: unknown,
+    via: "schema" | "json",
+  ): { send: boolean; message?: string; via: "schema" | "json" } | null => {
+    if (!obj || typeof obj !== "object") return null;
+    const o = obj as { checkin?: unknown; message?: unknown };
+    if (typeof o.checkin !== "boolean") return null;
+    if (!o.checkin) return { send: false, via };
+    const message = typeof o.message === "string" ? o.message.trim() : "";
+    // checkin:true with nothing to say is a contradiction. Believe the absence
+    // of a message over the flag — there is literally nothing to send.
+    if (!message || message === "NO_CHECKIN") return { send: false, via };
+    return { send: true, message, via };
+  };
+
+  const viaSchema = fromObject(structured, "schema");
+  if (viaSchema) return viaSchema;
+
+  const trimmed = text.trim();
+
+  // The SDK gave us no object, but `outputFormat` makes the text itself JSON.
+  // Parse it rather than posting a raw object to a chat.
+  if (trimmed.startsWith("{")) {
+    try {
+      const viaJson = fromObject(JSON.parse(trimmed), "json");
+      if (viaJson) return viaJson;
+    } catch {
+      // Fall through — malformed JSON is not a check-in.
+    }
+    return { send: false, via: "json" };
+  }
+
+  // Legacy sentinel, for tasks whose prompts predate the schema.
+  if (trimmed === "" || trimmed.startsWith("NO_CHECKIN")) return { send: false, via: "sentinel" };
+  return { send: true, message: trimmed, via: "sentinel" };
+}
 
 /** Convert a time zone to a Date representing the current wall-clock time in that zone. */
 function getTimeInZone(timezone: string): Date {
@@ -43,11 +132,11 @@ tools, so there is no status message to edit.
 
 INSTRUCTIONS:
 - Check the state of this project. Look at recent git activity, any pending work, the state of the codebase.
-- If there's something worth telling Chris about (a failing build, something interesting you notice, a suggestion, or a status update), compose a brief, conversational message.
-- If nothing notable is happening, respond with exactly: NO_CHECKIN
+- If there's something worth telling Chris about (a failing build, something interesting you notice, a suggestion, or a status update), set checkin to true and put a brief, conversational message in the message field.
+- If nothing notable is happening, set checkin to false and omit message. This is the expected outcome for most wakes.
 - Keep messages short and actionable — this goes to Telegram.
-- Don't check in just to say "everything is fine" — that's what NO_CHECKIN is for.
-- Max 2-3 check-ins per day per project. If you've been checking in frequently, lean toward NO_CHECKIN.`;
+- Don't check in just to say "everything is fine" — that is what checkin:false is for.
+- Max 2-3 check-ins per day per project. If you've been checking in frequently, lean toward checkin:false.`;
 }
 
 /**
@@ -223,24 +312,32 @@ export function startScheduler(
           const journal = formatJournalForPrompt(await readRecentOutbound(agent.id), timezone);
           const prompt = journal ? `${task.prompt}\n\n---\n\n${journal}` : task.prompt;
 
-          const response = await runner.run(agent, prompt, {
+          const runOpts: RunOpts = {
             timeout: task.timeoutMs ?? 600_000,
             priority: "low",
             sessionScope: "scheduled",
-          });
-          const trimmed = response.trim();
+          };
 
-          if (trimmed === "NO_CHECKIN" || trimmed.startsWith("NO_CHECKIN") || trimmed === "") {
-            log.info("scheduler", `Task ${taskKey}: no output to send`);
-            return;
-          }
+          // Ask for the schema when the runner supports it. The `run` fallback
+          // keeps injected test doubles and any older runner working.
+          const { text, structured } = runner.runStructured
+            ? await runner.runStructured(agent, prompt, CHECKIN_SCHEMA, runOpts)
+            : { text: await runner.run(agent, prompt, runOpts), structured: undefined };
 
           // Runner timeout text is a failure report, not agent output — never
-          // deliver it as a check-in.
-          if (/became unresponsive\. Session is saved/i.test(trimmed)) {
+          // deliver it as a check-in. Checked before interpretation, because a
+          // timeout produces prose that the sentinel path would read as a send.
+          if (/became unresponsive\. Session is saved/i.test(text)) {
             log.warn("scheduler", `Task ${taskKey}: run timed out — suppressing check-in`);
             return;
           }
+
+          const decision = interpretCheckin(text, structured);
+          if (!decision.send) {
+            log.info("scheduler", `Task ${taskKey}: no output to send`, { via: decision.via });
+            return;
+          }
+          const trimmed = decision.message!;
 
           const chatId = task.telegramChatId || agent.telegramChatId;
           if (!chatId) {
