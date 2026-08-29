@@ -1,39 +1,62 @@
 import { Command } from "commander";
 import { spawn } from "child_process";
 import { existsSync } from "fs";
-import { mkdir } from "fs/promises";
+import { readFile, mkdir } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
-
-const CDP_PORT = 9222;
-const CDP_URL = `http://localhost:${CDP_PORT}`;
+import { getClawsterHome, saveAgents, type AgentsConfig } from "../core/config.ts";
 
 /**
- * Dedicated user-data-dir for the Clawster debug Chrome. Keeping this
- * separate from the user's daily Chrome solves three problems at once:
- *   1. Avoids the LaunchServices flag-drop bug, where launching Chrome via
- *      `open -a "Google Chrome" --args ...` silently ignores the flags
- *      when any Chrome process is already running (helper processes,
- *      profile pickers, etc.). A separate user-data-dir forces a brand-new
- *      process tree that always honors --remote-debugging-port.
- *   2. Smaller blast radius. Only the sites you explicitly log into in
- *      this profile (FB, KSL, …) become reachable by Playwright-MCP-using
- *      agents. Your daily Chrome with banking, work email, etc. stays
- *      untouched.
- *   3. No conflict with your daily browsing. The debug Chrome runs in its
- *      own window; agents driving it via CDP don't grab focus from your
- *      tabs.
+ * Browser access for agents, via Claude Code's native Chrome integration.
+ *
+ * This replaces an earlier design that launched a dedicated Chrome with
+ * `--remote-debugging-port=9222` and drove it through `npx @playwright/mcp`
+ * over CDP. The harness now ships `--chrome`, which talks to the Claude in
+ * Chrome extension through a native-messaging host. That is better on every
+ * axis we cared about: no unauthenticated CDP port open on localhost, no npx
+ * cold start on every run, no second browser to keep logged in, and the
+ * browser is one Chris can actually see and take over.
+ *
+ * What we keep from the old design is the reason it existed: blast radius.
+ * The extension shares whatever browser it is attached to, so pointing agents
+ * at the everyday profile would hand a fleet running `bypassPermissions` the
+ * same session cookies as banking and work email. Instead we give agents their
+ * own Chrome *profile* inside the normal user-data-dir. Profiles have separate
+ * cookies and separate extension state, but share the native-messaging host at
+ * the user-data-dir level — so the host installed for the everyday profile
+ * already covers this one, and there is nothing extra to register.
  */
-function debugProfileDir(): string {
-  return process.env.CLAWSTER_BROWSER_PROFILE || join(homedir(), ".clawster", "chrome-debug-profile");
+
+/** Chrome profile directory name, relative to the Chrome user-data-dir. */
+const PROFILE_DIR = process.env.CLAWSTER_CHROME_PROFILE || "Clawster";
+
+/** The flag Clawster sets on an agent to grant browser access. */
+const CHROME_FLAG = "chrome";
+
+function chromeUserDataDir(): string {
+  if (process.env.CLAWSTER_CHROME_USER_DATA_DIR) return process.env.CLAWSTER_CHROME_USER_DATA_DIR;
+  return process.platform === "darwin"
+    ? join(homedir(), "Library", "Application Support", "Google", "Chrome")
+    : join(homedir(), ".config", "google-chrome");
 }
 
 /**
- * Common locations Chrome's binary ships at, in priority order. We launch
- * the binary directly rather than going through `open` because the macOS
- * launcher silently drops --args when an existing Chrome process owns the
- * LaunchServices slot.
+ * The native-messaging host manifest Claude Code installs the first time
+ * Chrome integration is enabled. It lives beside the profiles rather than
+ * inside one, which is what makes a second profile free.
  */
+function nativeHostManifest(): string {
+  return join(chromeUserDataDir(), "NativeMessagingHosts", "com.anthropic.claude_code_browser_extension.json");
+}
+
+/** Chrome Web Store id of the Claude in Chrome extension. */
+const EXTENSION_ID = "fcoeoabgfenejglbffodgkkbkcdhcgfn";
+const EXTENSION_URL = `https://chromewebstore.google.com/detail/claude/${EXTENSION_ID}`;
+
+function extensionInstalledIn(profile: string): boolean {
+  return existsSync(join(chromeUserDataDir(), profile, "Extensions", EXTENSION_ID));
+}
+
 function findChromeBinary(): string | null {
   if (process.env.CLAWSTER_CHROME_BIN && existsSync(process.env.CLAWSTER_CHROME_BIN)) {
     return process.env.CLAWSTER_CHROME_BIN;
@@ -43,172 +66,137 @@ function findChromeBinary(): string | null {
       ? [
           "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
           "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
-          "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
           "/Applications/Chromium.app/Contents/MacOS/Chromium",
         ]
-      : ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"];
-  for (const path of candidates) {
-    if (existsSync(path)) return path;
-  }
-  return null;
+      : ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium"];
+  return candidates.find((p) => existsSync(p)) ?? null;
 }
 
-function buildLaunchArgs(profile: string): string[] {
-  return [
-    `--remote-debugging-port=${CDP_PORT}`,
-    `--user-data-dir=${profile}`,
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-features=ChromeWhatsNewUI,SigninInterceptBubbleV2",
-  ];
-}
-
-function quote(s: string): string {
-  return /[\s"'$`\\]/.test(s) ? `"${s.replace(/(["\\$`])/g, "\\$1")}"` : s;
-}
-
-function launchCmdForDisplay(binary: string, profile: string): string {
-  return [quote(binary), ...buildLaunchArgs(profile).map(quote)].join(" ");
-}
-
-async function cdpAlive(timeoutMs = 1500): Promise<boolean> {
+async function loadAgentsFile(): Promise<AgentsConfig> {
   try {
-    const resp = await fetch(`${CDP_URL}/json/version`, { signal: AbortSignal.timeout(timeoutMs) });
-    return resp.ok;
+    return JSON.parse(await readFile(join(getClawsterHome(), "agents.json"), "utf-8"));
   } catch {
-    return false;
+    return { agents: [], unboundChatIds: [] };
   }
 }
 
-async function readChromeInfo(): Promise<Record<string, unknown> | null> {
-  try {
-    const resp = await fetch(`${CDP_URL}/json/version`, { signal: AbortSignal.timeout(3000) });
-    if (!resp.ok) return null;
-    return (await resp.json()) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
+function isGranted(agent: { extraArgs?: Record<string, string | null> }): boolean {
+  return agent.extraArgs !== undefined && CHROME_FLAG in agent.extraArgs;
 }
 
-const browserStatusCmd = new Command("status")
-  .description("Check whether the debug Chrome is reachable on the CDP port")
+export const browserCommand = new Command("browser").description(
+  "Manage agent browser access (Claude in Chrome)",
+);
+
+browserCommand
+  .command("status")
+  .description("Check whether browser access is wired up, and who has it")
   .action(async () => {
-    const profile = debugProfileDir();
-    console.log(`\nChecking ${CDP_URL}/json/version ...\n`);
-    const info = await readChromeInfo();
-    if (!info) {
-      console.log(`  ✗ No CDP endpoint at ${CDP_URL}.`);
-      console.log(`  Debug profile: ${profile}`);
-      console.log("  → Run: clawster browser init");
-      process.exit(1);
+    const host = nativeHostManifest();
+    const bin = findChromeBinary();
+    const agents = (await loadAgentsFile()).agents;
+    const granted = agents.filter(isGranted);
+
+    console.log("\n=== Browser Access ===\n");
+    console.log(`  Chrome binary:      ${bin ?? "NOT FOUND"}`);
+    console.log(`  Native host:        ${existsSync(host) ? "installed" : "MISSING — run a session with --chrome once"}`);
+    console.log(`  Extension (Default):${extensionInstalledIn("Default") ? " installed" : " not installed"}`);
+    console.log(`  Extension (${PROFILE_DIR}): ${extensionInstalledIn(PROFILE_DIR) ? "installed" : "NOT INSTALLED — run: clawster browser init"}`);
+    console.log(`  Agent profile dir:  ${join(chromeUserDataDir(), PROFILE_DIR)}`);
+
+    console.log(`\n  Agents with browser access (${granted.length}/${agents.length}):`);
+    if (granted.length === 0) {
+      console.log("    (none) — grant with: clawster browser grant <agentId>");
+    } else {
+      for (const a of granted) console.log(`    ${a.id}  (${a.name})`);
     }
-    console.log("  ✓ CDP endpoint live.");
-    console.log(`    Browser:           ${info.Browser ?? "(unknown)"}`);
-    console.log(`    Protocol-Version:  ${info["Protocol-Version"] ?? "?"}`);
-    console.log(`    User-Agent:        ${info["User-Agent"] ?? "?"}`);
-    console.log(`    Debug profile:     ${profile}`);
+
+    // Chrome must actually be running. `list_connected_browsers` reports a
+    // browser from its last session even when none is open, so an agent can
+    // believe it has a browser and then fail on the first action.
+    const running = await isChromeRunning();
+    console.log(`\n  Chrome running:     ${running ? "yes" : "NO — browser actions will fail until it is"}`);
     console.log("");
   });
 
-const browserChromeCmd = new Command("chrome")
-  .description("Print the Chrome launch command (for copy/paste)")
-  .action(() => {
-    const binary = findChromeBinary();
-    const profile = debugProfileDir();
-    if (!binary) {
-      console.error("Google Chrome not found at any standard location.");
-      console.error("Set CLAWSTER_CHROME_BIN to override.");
+browserCommand
+  .command("init")
+  .description(`Create and open the dedicated "${PROFILE_DIR}" Chrome profile for agents`)
+  .action(async () => {
+    const bin = findChromeBinary();
+    if (!bin) {
+      console.error("Chrome not found. Set CLAWSTER_CHROME_BIN to its path.");
       process.exit(1);
     }
-    console.log(launchCmdForDisplay(binary, profile));
+
+    await mkdir(join(chromeUserDataDir(), PROFILE_DIR), { recursive: true });
+
+    console.log(`\nOpening the "${PROFILE_DIR}" Chrome profile.\n`);
+    console.log("This profile is separate from your everyday one: separate cookies,");
+    console.log("separate logins, separate extensions. Agents get this profile and");
+    console.log("nothing else, so a prompt-injected agent cannot reach the sessions");
+    console.log("in your Default profile.\n");
+    console.log("Two things to do in the window that opens:\n");
+    console.log(`  1. Install the Claude in Chrome extension:`);
+    console.log(`     ${EXTENSION_URL}`);
+    console.log(`  2. Sign in to claude.ai in this profile — the extension cannot`);
+    console.log(`     authenticate without it.\n`);
+    console.log("Then log into the sites you want agents to reach, and only those.\n");
+    console.log("Verify with: clawster browser status\n");
+
+    const child = spawn(bin, [`--profile-directory=${PROFILE_DIR}`, EXTENSION_URL], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
   });
 
-const browserInitCmd = new Command("init")
-  .description("Launch a dedicated debug Chrome with persistent profile for Playwright-MCP")
-  .option("--timeout <seconds>", "Seconds to wait for CDP endpoint", "60")
-  .action(async (opts: { timeout: string }) => {
-    const timeoutSec = parseInt(opts.timeout, 10) || 60;
-    const profile = debugProfileDir();
-
-    console.log("\n=== Clawster browser init ===\n");
-
-    if (await cdpAlive()) {
-      const info = await readChromeInfo();
-      console.log("  ✓ Debug Chrome already running on the CDP port.");
-      if (info?.Browser) console.log(`    ${info.Browser}`);
-      console.log(`    Debug profile: ${profile}`);
-      console.log("\nNothing more to do. Restricted agents listing");
-      console.log('  "mcpServers": ["playwright"]');
-      console.log("in agents.json will attach on their next turn.\n");
+browserCommand
+  .command("grant <agentId>")
+  .description("Give an agent browser access (adds --chrome to its runs)")
+  .action(async (agentId: string) => {
+    const data = await loadAgentsFile();
+    const agent = data.agents.find((a) => a.id === agentId);
+    if (!agent) {
+      console.error(`No agent with id "${agentId}".`);
+      process.exit(1);
+    }
+    if (isGranted(agent)) {
+      console.log(`${agent.name} already has browser access.`);
       return;
     }
-
-    const binary = findChromeBinary();
-    if (!binary) {
-      console.error("Google Chrome not found at any standard location:");
-      console.error("  /Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
-      console.error("  /usr/bin/google-chrome  (Linux)");
-      console.error("Install Chrome, or set CLAWSTER_CHROME_BIN to the binary path.\n");
-      process.exit(1);
-    }
-
-    await mkdir(profile, { recursive: true });
-
-    console.log("Launching a dedicated debug Chrome with its own profile.");
-    console.log(`  Binary:        ${binary}`);
-    console.log(`  Debug profile: ${profile}`);
-    console.log(`  CDP port:      ${CDP_PORT}\n`);
-    console.log("This is a separate Chrome from your daily browser. On first launch,");
-    console.log("you'll need to log into any sites you want agents to reach (Facebook,");
-    console.log("KSL, …). Cookies persist in the debug profile, so future runs skip");
-    console.log("the login step. Your daily Chrome is untouched.\n");
-
-    const autoLaunch = process.env.CLAWSTER_BROWSER_AUTOLAUNCH !== "0";
-    if (!autoLaunch) {
-      console.log("Auto-launch disabled (CLAWSTER_BROWSER_AUTOLAUNCH=0).");
-      console.log("Run this manually in another terminal:");
-      console.log(`  ${launchCmdForDisplay(binary, profile)}\n`);
-    } else {
-      console.log("Launching... (set CLAWSTER_BROWSER_AUTOLAUNCH=0 to disable)\n");
-      // Detached spawn so Chrome survives this CLI exiting. stdio ignored so
-      // its window-server chatter doesn't pollute the terminal.
-      const child = spawn(binary, buildLaunchArgs(profile), {
-        detached: true,
-        stdio: "ignore",
-      });
-      child.unref();
-    }
-
-    const deadline = Date.now() + timeoutSec * 1000;
-    process.stdout.write(`Waiting up to ${timeoutSec}s for CDP at ${CDP_URL} ...`);
-    while (Date.now() < deadline) {
-      if (await cdpAlive()) {
-        process.stdout.write(" ✓\n");
-        const info = await readChromeInfo();
-        if (info?.Browser) console.log(`  ${info.Browser}\n`);
-        console.log("Setup complete. Restricted agents with playwright in their");
-        console.log("mcpServers allowlist will attach on their next turn.");
-        console.log("\nNext: in the new Chrome window, log into the sites you want");
-        console.log("agents to reach (e.g. facebook.com/marketplace).\n");
-        return;
-      }
-      process.stdout.write(".");
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-
-    process.stdout.write(" ✗\n");
-    console.error(`\nCDP endpoint at ${CDP_URL} did not come up within ${timeoutSec}s.`);
-    console.error("Possible causes:");
-    console.error(`  • Port ${CDP_PORT} is already in use by another process.`);
-    console.error(`    Check: lsof -nP -i :${CDP_PORT}`);
-    console.error("  • Chrome binary is wrong. Override with CLAWSTER_CHROME_BIN.");
-    console.error(`  • Profile dir is corrupt. Try: rm -rf "${profile}"`);
-    console.error("");
-    process.exit(1);
+    // `null` is the SDK's encoding for a boolean CLI flag; agent-runner passes
+    // extraArgs straight through to the query options.
+    agent.extraArgs = { ...(agent.extraArgs ?? {}), [CHROME_FLAG]: null };
+    await saveAgents(data);
+    console.log(`Granted browser access to ${agent.name} (${agent.id}).`);
+    console.log(`Takes effect on that agent's next run — no restart needed.`);
   });
 
-export const browserCommand = new Command("browser")
-  .description("Manage the Playwright-MCP debug browser")
-  .addCommand(browserInitCmd)
-  .addCommand(browserStatusCmd)
-  .addCommand(browserChromeCmd);
+browserCommand
+  .command("revoke <agentId>")
+  .description("Remove an agent's browser access")
+  .action(async (agentId: string) => {
+    const data = await loadAgentsFile();
+    const agent = data.agents.find((a) => a.id === agentId);
+    if (!agent) {
+      console.error(`No agent with id "${agentId}".`);
+      process.exit(1);
+    }
+    if (!isGranted(agent)) {
+      console.log(`${agent.name} does not have browser access.`);
+      return;
+    }
+    delete agent.extraArgs![CHROME_FLAG];
+    if (Object.keys(agent.extraArgs!).length === 0) delete agent.extraArgs;
+    await saveAgents(data);
+    console.log(`Revoked browser access from ${agent.name} (${agent.id}).`);
+  });
+
+async function isChromeRunning(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const p = spawn("pgrep", ["-x", process.platform === "darwin" ? "Google Chrome" : "chrome"]);
+    p.on("close", (code) => resolve(code === 0));
+    p.on("error", () => resolve(false));
+  });
+}
