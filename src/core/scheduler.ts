@@ -36,6 +36,11 @@ function buildHeartbeatPrompt(agent: AgentConfig, timezone: string): string {
 
 Current time: ${formatTime(timezone)}
 
+Before composing anything, read ~/projects/clawster-orchestrator/prompts/conduct.md
+and apply it — the pre-send gate, answer-first shape, and citation rules all
+apply to this message. Skip its §4: you are a scheduled wake with no plugin
+tools, so there is no status message to edit.
+
 INSTRUCTIONS:
 - Check the state of this project. Look at recent git activity, any pending work, the state of the codebase.
 - If there's something worth telling Chris about (a failing build, something interesting you notice, a suggestion, or a status update), compose a brief, conversational message.
