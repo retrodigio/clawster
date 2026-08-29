@@ -91,9 +91,10 @@ templates/                # Templates for new workspace CLAUDE.md files
 | `clawster daemon install` | Install launchd daemon for auto-start |
 | `clawster daemon uninstall` | Remove launchd daemon |
 | `clawster migrate` | Migrate from OpenClaw format |
-| `clawster browser init` | Walk through Chrome + Playwright-MCP setup |
-| `clawster browser status` | Check whether Chrome is reachable on CDP port 9222 |
-| `clawster browser chrome` | Print the Chrome launch command (for copy/paste) |
+| `clawster browser init` | Create and open the dedicated `Clawster` Chrome profile |
+| `clawster browser status` | Check extension, native host, Chrome, and who has access |
+| `clawster browser grant <agentId>` | Give an agent browser access (`--chrome`) |
+| `clawster browser revoke <agentId>` | Remove an agent's browser access |
 
 ## Config Structure
 
@@ -318,35 +319,50 @@ All MCP servers live in `config/mcp-servers.json`. Each entry may carry an optio
 
 Today the only restricted server is `playwright`, because the dedicated debug Chrome it drives accumulates authenticated logins. Granting an agent `playwright` means that agent can navigate, click, and screenshot any site you've logged into in the debug profile — so grant it deliberately, not fleet-wide.
 
-### Browser MCP (Playwright)
+### Browser access (Claude in Chrome)
 
-The `playwright` MCP attaches over the Chrome DevTools Protocol to a **dedicated debug Chrome** with its own user-data-dir at `~/.clawster/chrome-debug-profile/`. This matches OpenClaw's default driver pattern (Playwright + persistent profile), not its `existing-session` mode.
+Agents reach the browser through Claude Code's **native Chrome integration**,
+enabled per agent with the `--chrome` flag:
 
-Why dedicated and not your daily Chrome:
-- `open -a "Google Chrome" --args --remote-debugging-port=9222` silently drops the flag when any Chrome process is already running (helper processes, profile pickers, etc.). A separate user-data-dir forces a brand-new process tree that always honors the flag.
-- Smaller blast radius. Only the sites you log into in the debug profile are reachable by agents — banking, work email, etc. in your daily Chrome stay untouched.
-- No conflict with your daily browsing. Agent automations don't grab focus from your tabs.
-
-**One-time setup:**
-
-```bash
-clawster browser init       # launches dedicated debug Chrome, waits for CDP endpoint
-clawster browser status     # checks whether the debug Chrome is up
-clawster browser chrome     # prints the Chrome launch command (for copy/paste)
+```json
+{ "id": "main", "extraArgs": { "chrome": null } }
 ```
 
-After `init`, log into the sites you want agents to reach (facebook.com/marketplace, ksl.com/classifieds, etc.) in the new Chrome window. Cookies persist in the debug profile; future runs skip the login dance.
+`null` is the SDK's encoding for a boolean flag; `agent-runner.ts` passes
+`extraArgs` straight through, so this needs no code and no restart — it applies
+on the agent's next run. Manage it with `clawster browser grant|revoke <agentId>`.
 
-**Environment overrides:**
-- `CLAWSTER_BROWSER_PROFILE` — override the debug-profile path (default `~/.clawster/chrome-debug-profile`).
-- `CLAWSTER_CHROME_BIN` — override the Chrome binary path (defaults to `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` on macOS, `/usr/bin/google-chrome` on Linux).
-- `CLAWSTER_BROWSER_AUTOLAUNCH=0` — disable auto-launch; print the command instead.
+**This replaced a CDP + Playwright design.** The old `clawster browser init`
+launched a dedicated Chrome with `--remote-debugging-port=9222` and drove it via
+`npx @playwright/mcp@latest`. The native path is better on every axis we cared
+about: no unauthenticated CDP port on localhost, no npx cold start per run, no
+second browser to keep logged in, and the browser is one Chris can see and take
+over. Verified working in headless `claude -p` — 22 `mcp__claude-in-chrome__*`
+tools load, including `list_connected_browsers` and `select_browser`.
 
-**Granting an agent access:**
+**Blast radius is why a dedicated profile still exists.** The extension shares
+whatever browser it attaches to, so pointing a `bypassPermissions` fleet at the
+everyday profile would hand it the same cookies as banking and work email.
+Agents instead get their own Chrome **profile** — `Clawster`, inside the normal
+user-data-dir. Profiles have separate cookies and separate extension state but
+share the native-messaging host at the user-data-dir level
+(`~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.anthropic.claude_code_browser_extension.json`),
+so the host installed for the everyday profile already covers this one and there
+is nothing extra to register. `clawster browser init` creates and opens it.
 
-Add `"mcpServers": ["playwright"]` to its entry in `agents.json`. Today only `main` (Zero) has this.
+**Two things that will bite:**
 
-**Security trade-off:** the debug Chrome inherits any site you log into *in that profile*. Keep `mcpServers: ["playwright"]` narrow. Family agents (Bugs' Bot, Aust' Bot) must never get it. Also: the CDP port (9222) has no auth — any process on localhost can connect. Acceptable for a single-user Mac; revisit if untrusted local code ever runs on this box.
+- **Chrome must actually be running.** `list_connected_browsers` reports a
+  browser from its last session even when none is open, so an agent can believe
+  it has a browser and fail on the first action. `clawster browser status`
+  checks this.
+- **Auth mode is load-bearing.** Chrome integration is force-disabled for
+  sessions authenticated by API key or `claude setup-token`, even with
+  `--chrome` passed. The daemon works today because it inherits `HOME` and uses
+  the same `/login` OAuth credentials as the terminal. Moving it to a long-lived
+  token would silently kill browser access with no error.
+
+Grant deliberately. Family agents (Bugs' Bot, Aust' Bot) must never get it.
 
 ## Conventions
 
