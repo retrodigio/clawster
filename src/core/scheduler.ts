@@ -1,6 +1,7 @@
 import { log } from "./logger.ts";
 import { matchesCron, getNextMatch } from "./cron.ts";
 import type { AgentConfig, TaskConfig } from "./types.ts";
+import { appendOutbound, readRecentOutbound, formatJournalForPrompt } from "./outbound-journal.ts";
 
 type Runner = {
   run(
@@ -77,10 +78,28 @@ function heartbeatToCron(every: string, activeHours?: { start: string; end: stri
   return `${minuteField} ${hourField} * * *`;
 }
 
-async function sendTelegram(botToken: string, chatId: string, text: string, topicId?: number): Promise<boolean> {
+/**
+ * Send a check-in, reporting the message id of the FIRST chunk.
+ *
+ * That id is the citable anchor. Conduct §3 asks for a t.me permalink when
+ * referring back to a past statement, and the outbound journal needs somewhere
+ * to point; a long check-in splits across several messages but the claim lives
+ * in the first one, so that is the one worth remembering.
+ *
+ * `ok` is reported separately from `messageId` because a send can succeed
+ * while the id is unrecoverable (unparseable response body). Delivered but
+ * unciteable is a degradation, not a failure — don't conflate the two.
+ */
+async function sendTelegram(
+  botToken: string,
+  chatId: string,
+  text: string,
+  topicId?: number,
+): Promise<{ ok: boolean; messageId?: number }> {
   // Telegram hard limit is 4096 chars/message — chunk long check-ins instead
   // of letting the whole send fail.
   const MAX = 4000;
+  let messageId: number | undefined;
   for (let i = 0; i < text.length; i += MAX) {
     const body: Record<string, unknown> = { chat_id: chatId, text: text.slice(i, i + MAX) };
     if (topicId) body.message_thread_id = topicId;
@@ -89,9 +108,15 @@ async function sendTelegram(botToken: string, chatId: string, text: string, topi
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!response.ok) return false;
+    if (!response.ok) return { ok: false };
+    if (messageId === undefined) {
+      const payload = (await response.json().catch(() => null)) as
+        | { result?: { message_id?: number } }
+        | null;
+      messageId = payload?.result?.message_id;
+    }
   }
-  return true;
+  return messageId === undefined ? { ok: true } : { ok: true, messageId };
 }
 
 /** Resolve the effective task list for an agent, converting legacy heartbeat config if needed. */
@@ -186,7 +211,14 @@ export function startScheduler(
           // then got SENT as check-ins.
           // sessionScope keeps scheduled runs in their own session so they
           // never advance the user's conversation pointer.
-          const response = await runner.run(agent, task.prompt, {
+          // A scheduled wake is a fresh process with no memory of the last
+          // one. Hand it what it previously said unprompted, so it can avoid
+          // repeating itself and can honour conduct §8 — no NO_CHECKIN while a
+          // blocker it already reported is still standing.
+          const journal = formatJournalForPrompt(await readRecentOutbound(agent.id), timezone);
+          const prompt = journal ? `${task.prompt}\n\n---\n\n${journal}` : task.prompt;
+
+          const response = await runner.run(agent, prompt, {
             timeout: task.timeoutMs ?? 600_000,
             priority: "low",
             sessionScope: "scheduled",
@@ -212,10 +244,22 @@ export function startScheduler(
           }
 
           const sent = await sendTelegram(botToken, chatId, trimmed, task.topicId);
-          if (sent) {
-            log.info("scheduler", `Task ${taskKey}: sent to Telegram`, { chatId, topicId: task.topicId });
-          } else {
+          if (!sent.ok) {
             log.warn("scheduler", `Task ${taskKey}: failed to send Telegram message`, { chatId });
+            return;
+          }
+
+          log.info("scheduler", `Task ${taskKey}: sent to Telegram`, { chatId, topicId: task.topicId });
+
+          if (sent.messageId !== undefined) {
+            await appendOutbound({
+              agentId: agent.id,
+              task: task.name,
+              chatId,
+              ...(task.topicId ? { topicId: task.topicId } : {}),
+              messageId: sent.messageId,
+              text: trimmed,
+            });
           }
         } catch (err) {
           log.error("scheduler", `Task ${taskKey} failed`, { error: String(err) });
