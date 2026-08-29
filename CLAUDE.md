@@ -236,6 +236,32 @@ Agents with a `heartbeat` config proactively check in on their project. The hear
 5. If nothing notable, the agent responds `NO_CHECKIN` and stays silent
 6. Initial ticks are staggered randomly (0-60s) to avoid thundering herd
 
+## Outbound Journal
+
+Every message a scheduled task sends is recorded, one JSON line per message, at
+`~/.clawster/journal/<agentId>.jsonl` — timestamp, task name, chat, Telegram
+`message_id`, a `t.me` permalink, and the opening ~240 characters of the message
+as the `claim`. Written by `src/core/scheduler.ts` after a successful send;
+implemented in `src/core/outbound-journal.ts`.
+
+The point is that a scheduled wake is a fresh `claude -p` process with no memory
+of the previous one and no plugin tools. Two failures follow from that, and the
+journal fixes both by being read back into the next wake's prompt:
+
+- **Repetition.** Wake N cannot otherwise know that wake N-1 already reported the
+  red build.
+- **Ambiguous silence.** `NO_CHECKIN` is binary and memoryless, so it cannot
+  distinguish "nothing happened" from "still blocked". The conduct standard
+  (`~/projects/clawster-orchestrator/prompts/conduct.md` §8) forbids `NO_CHECKIN`
+  while a previously-reported blocker stands — a rule an agent can only follow if
+  it can see what it previously reported.
+
+It is deliberately **not** a general message log. Replies to a human are not
+journaled: they were solicited, the human has them on screen, and they are not
+what an agent needs to avoid repeating. Files are capped at 200 entries and
+trimmed on write. A journal failure never costs a delivered message — the send
+has already happened, so a write error is logged and swallowed.
+
 ## Model Modes (three-tier hierarchy)
 
 Every chat (and every forum topic) runs in one of three **modes**, each mapped to
