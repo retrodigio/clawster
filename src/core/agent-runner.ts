@@ -1,4 +1,10 @@
 import { query, type Query, type Options } from "@anthropic-ai/claude-agent-sdk";
+
+/**
+ * The SDK's structured-output request shape, taken structurally off `Options`
+ * so we track the installed SDK rather than pinning our own copy of the type.
+ */
+export type OutputFormat = NonNullable<Options["outputFormat"]>;
 import { log } from "./logger.ts";
 import type { AgentConfig } from "./types.ts";
 import { getSession, saveSession, clearSession } from "./session-store.ts";
@@ -105,7 +111,12 @@ export function createAgentRunner(options: {
     return topicId ? `${agentId}-topic-${topicId}` : agentId;
   }
 
-  function buildQueryOptions(agent: AgentConfig, resumeSessionId: string | null, model: string = DEFAULT_MODEL): Options {
+  function buildQueryOptions(
+    agent: AgentConfig,
+    resumeSessionId: string | null,
+    model: string = DEFAULT_MODEL,
+    outputFormat?: OutputFormat,
+  ): Options {
     const opts: Options = {
       model,
       cwd: agent.workspace,
@@ -170,6 +181,13 @@ export function createAgentRunner(options: {
 
     if (agent.extraArgs) {
       opts.extraArgs = agent.extraArgs;
+    }
+
+    // Scheduled runs ask for a schema so the caller can read a decision off a
+    // field instead of scraping prose for a sentinel. Absent for conversational
+    // runs, where free text IS the product.
+    if (outputFormat) {
+      opts.outputFormat = outputFormat;
     }
 
     return opts;
@@ -296,6 +314,28 @@ export function createAgentRunner(options: {
   }
 
   /**
+   * Like `run`, but asks the model to fill a schema and hands back the parsed
+   * object alongside the text.
+   *
+   * `structured` is undefined when the model never produced a conforming
+   * object — schema retries exhausted, or a run that timed out before the
+   * result message. Absence means "no decision was made", and a caller must
+   * not read a default out of it.
+   */
+  async function runStructured(
+    agent: AgentConfig,
+    prompt: string,
+    outputFormat: OutputFormat,
+    runOptions?: { topicId?: number; timeout?: number; priority?: QueryPriority; sessionScope?: string },
+  ): Promise<{ text: string; structured?: unknown }> {
+    const { text, structured } = await runStreaming(agent, prompt, () => {}, {
+      ...runOptions,
+      outputFormat,
+    });
+    return { text, structured };
+  }
+
+  /**
    * Streaming run — used by text message handler.
    * Activity-based timeout: 3min inactivity, 30min max.
    * Reports activity status via onActivity callback.
@@ -324,8 +364,14 @@ export function createAgentRunner(options: {
        *     The prior caller's runStreaming will throw InterruptedByNextMessageError.
        */
       onBusy?: "interrupt" | "queue";
+      /**
+       * Ask the model for a JSON object matching this schema. The parsed value
+       * comes back as `structured` alongside the text, so a caller can branch
+       * on a field instead of pattern-matching prose.
+       */
+      outputFormat?: OutputFormat;
     },
-  ): Promise<{ text: string; sessionId: string | null }> {
+  ): Promise<{ text: string; sessionId: string | null; structured?: unknown }> {
     if (isShuttingDown) {
       throw new Error("Runner is shutting down — not accepting new queries");
     }
@@ -377,7 +423,7 @@ export function createAgentRunner(options: {
           ? (session?.sessionId ?? null)
           : (interruptedSessionId ?? session?.sessionId ?? null);
 
-        const opts = buildQueryOptions(agent, resumeSessionId, model);
+        const opts = buildQueryOptions(agent, resumeSessionId, model, runOptions?.outputFormat);
 
         log.info(agent.id, "Starting SDK streaming query", {
           hasSession: !!resumeSessionId,
@@ -410,6 +456,8 @@ export function createAgentRunner(options: {
 
         try {
           let resultText: string | null = null;
+
+          let structured: unknown;
           let lastUpdateTime = 0;
           let lastActivityTime = 0;
           const startTime = Date.now();
@@ -506,6 +554,17 @@ export function createAgentRunner(options: {
               if ("result" in message) {
                 resultText = message.result ?? accumulated;
               }
+              // Present only when `outputFormat` was requested and the model
+              // produced a conforming object. A run that exhausted its retries
+              // arrives as subtype `error_max_structured_output_retries` with
+              // no `structured_output` — callers must treat absence as "no
+              // decision", never as a default decision.
+              if ("structured_output" in message) {
+                structured = (message as { structured_output?: unknown }).structured_output;
+              }
+              if ((message as { subtype?: string }).subtype === "error_max_structured_output_retries") {
+                log.warn(agent.id, "Structured output failed schema validation after retries");
+              }
               if (message.session_id) {
                 sessionId = message.session_id;
               }
@@ -556,7 +615,7 @@ export function createAgentRunner(options: {
             elapsed: timer.elapsed,
           });
 
-          return { text: finalText.trim(), sessionId };
+          return { text: finalText.trim(), sessionId, structured };
         } catch (err) {
           timer.clear();
           // If this query was interrupted by a subsequent user message, throw
@@ -695,5 +754,5 @@ export function createAgentRunner(options: {
     return !isShuttingDown;
   }
 
-  return { run, runStreaming, shutdown, drain, isAccepting };
+  return { run, runStructured, runStreaming, shutdown, drain, isAccepting };
 }
