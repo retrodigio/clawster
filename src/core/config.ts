@@ -153,10 +153,14 @@ export const ClawsterConfigSchema = z.object({
      * session inherits whatever is in the operator's own ~/.claude/settings.json,
      * which is a personal preference leaking into fleet latency.
      *
-     * Empty string = inherit (previous behaviour).
+     * Defaults to inherit. Pinning the session also pins every subagent it
+     * spawns — the Agent tool inherits the parent's model when the call does
+     * not name one, and the spawn briefing does not — so `sonnet` here quietly
+     * moved all project work to sonnet, not just routing. Until the briefing
+     * sets a per-subagent model, this must stay empty.
      */
-    model: z.string().default("sonnet"),
-    effort: z.enum(["", "low", "medium", "high", "xhigh"]).default("low"),
+    model: z.string().default(""),
+    effort: z.enum(["", "low", "medium", "high", "xhigh"]).default(""),
   }).default({
     tmuxSession: "orchestrator",
     cwd: "",
@@ -164,8 +168,8 @@ export const ClawsterConfigSchema = z.object({
     channelServer: "telegram-channel",
     pollSeconds: 30,
     chrome: true,
-    model: "sonnet",
-    effort: "low",
+    model: "",
+    effort: "",
   }),
 });
 

@@ -64,8 +64,8 @@ export function defaultOptions(): OrchestratorSupervisorOptions {
     stateDir: join(homedir(), ".claude", "channels", "telegram"),
     channelServer: "telegram-channel",
     chrome: true,
-    model: "sonnet",
-    effort: "low",
+    model: "",
+    effort: "",
     recoveryDir: join(process.env.CLAWSTER_HOME ?? join(homedir(), ".clawster"), "recovery"),
   };
 }

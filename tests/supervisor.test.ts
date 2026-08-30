@@ -256,13 +256,13 @@ describe("orchestrator spawn — model and effort", () => {
     return captured.at(-1) ?? "";
   }
 
-  test("defaults pin the session to sonnet at low effort", async () => {
-    // Routing is a lookup, not reasoning. Left unpinned the session inherits
-    // the operator's personal ~/.claude/settings.json, which measured 9-63s
-    // per dispatch at opus/high.
+  test("defaults emit no model or effort flag", async () => {
+    // Pinning the session pins every subagent it spawns, because the Agent
+    // tool inherits the parent's model when the call does not name one. Until
+    // the spawn briefing sets a per-subagent model, the default must inherit.
     const c = await cmd({});
-    expect(c).toContain("--model sonnet");
-    expect(c).toContain("--effort low");
+    expect(c).not.toContain("--model");
+    expect(c).not.toContain("--effort");
   });
 
   test("empty strings mean inherit, not an empty flag", async () => {
