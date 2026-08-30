@@ -144,6 +144,19 @@ export const ClawsterConfigSchema = z.object({
      * flag has to live here to survive.
      */
     chrome: z.boolean().default(true),
+    /**
+     * Model and effort for the orchestrator session itself.
+     *
+     * Its main job is routing — look up a thread, hand it to a subagent — which
+     * is a lookup against very explicit instructions, not reasoning. Measured at
+     * opus/high it took 9-63s (median ~26s) just to dispatch. Left unset the
+     * session inherits whatever is in the operator's own ~/.claude/settings.json,
+     * which is a personal preference leaking into fleet latency.
+     *
+     * Empty string = inherit (previous behaviour).
+     */
+    model: z.string().default("sonnet"),
+    effort: z.enum(["", "low", "medium", "high", "xhigh"]).default("low"),
   }).default({
     tmuxSession: "orchestrator",
     cwd: "",
@@ -151,6 +164,8 @@ export const ClawsterConfigSchema = z.object({
     channelServer: "telegram-channel",
     pollSeconds: 30,
     chrome: true,
+    model: "sonnet",
+    effort: "low",
   }),
 });
 
