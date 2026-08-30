@@ -18,6 +18,11 @@ config/agents.json
 logs
 *.log
 
+# scratch from the retired Playwright/CDP browser design (see CLAUDE.md).
+# `*.log` already covered the console dumps; the page-*.yml accessibility
+# snapshots were not, and some captured logged-in pages.
+.playwright-mcp/
+
 # caches
 .eslintcache
 .cache
