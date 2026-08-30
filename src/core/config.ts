@@ -135,12 +135,22 @@ export const ClawsterConfigSchema = z.object({
     channelServer: z.string().default("telegram-channel"),
     /** Supervision poll interval. */
     pollSeconds: z.number().int().min(5).max(600).default(30),
+    /**
+     * Start the orchestrator with `--chrome` (native Claude in Chrome).
+     *
+     * Defaults on: the supervisor owns the session's lifecycle, so a
+     * hand-started `claude --chrome` is silently replaced by a flagless one on
+     * the next restart — browser tools vanish mid-thread with no error. The
+     * flag has to live here to survive.
+     */
+    chrome: z.boolean().default(true),
   }).default({
     tmuxSession: "orchestrator",
     cwd: "",
     stateDir: "",
     channelServer: "telegram-channel",
     pollSeconds: 30,
+    chrome: true,
   }),
 });
 

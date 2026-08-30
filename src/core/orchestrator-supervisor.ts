@@ -36,6 +36,8 @@ export interface OrchestratorSupervisorOptions {
   stateDir: string;
   /** MCP server name to load as a channel. */
   channelServer: string;
+  /** Pass `--chrome` so the session gets the native Chrome integration. */
+  chrome: boolean;
   /** Where recovery manifests are written. */
   recoveryDir: string;
   config?: SupervisorConfig;
@@ -57,6 +59,7 @@ export function defaultOptions(): OrchestratorSupervisorOptions {
     cwd: join(homedir(), "projects", "clawster-orchestrator"),
     stateDir: join(homedir(), ".claude", "channels", "telegram"),
     channelServer: "telegram-channel",
+    chrome: true,
     recoveryDir: join(process.env.CLAWSTER_HOME ?? join(homedir(), ".clawster"), "recovery"),
   };
 }
@@ -303,7 +306,7 @@ export class OrchestratorSupervisor {
     const cmd = [
       "tmux", "new-session", "-d", "-s", this.opts.tmuxSession,
       "-x", "220", "-y", "50", "-c", this.opts.cwd,
-      `claude --dangerously-load-development-channels server:${this.opts.channelServer} --dangerously-skip-permissions`,
+      `claude${this.opts.chrome ? " --chrome" : ""} --dangerously-load-development-channels server:${this.opts.channelServer} --dangerously-skip-permissions`,
     ];
     const r = await this.opts.exec(cmd);
     if (r.code !== 0) {

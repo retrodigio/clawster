@@ -199,3 +199,37 @@ describe("buildRecoveryManifest", () => {
     expect(m.teamsConfigPath).toBeUndefined();
   });
 });
+
+describe("orchestrator spawn — chrome flag", () => {
+  async function spawnCmd(chrome: boolean): Promise<string[]> {
+    const { OrchestratorSupervisor, defaultOptions } = await import(
+      "../src/core/orchestrator-supervisor.ts"
+    );
+    let captured: string[] = [];
+    const sup = new OrchestratorSupervisor({
+      ...defaultOptions(),
+      chrome,
+      exec: async (cmd: string[]) => {
+        if (cmd[1] === "new-session") captured = cmd;
+        return { code: 0, stdout: "" };
+      },
+    });
+    await sup.startOrchestrator(1);
+    return captured;
+  }
+
+  test("chrome:true puts --chrome on the claude command", async () => {
+    // The supervisor owns the session's lifecycle, so a hand-started
+    // `claude --chrome` is replaced by this command on the next restart.
+    // If the flag is not here, browser tools vanish mid-thread with no error.
+    const cmd = await spawnCmd(true);
+    expect(cmd.at(-1)).toContain("claude --chrome ");
+    expect(cmd.at(-1)).toContain("--dangerously-load-development-channels");
+  });
+
+  test("chrome:false omits it without mangling the rest", async () => {
+    const cmd = await spawnCmd(false);
+    expect(cmd.at(-1)).not.toContain("--chrome");
+    expect(cmd.at(-1)).toStartWith("claude --dangerously-load-development-channels");
+  });
+});
