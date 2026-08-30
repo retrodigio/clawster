@@ -350,6 +350,38 @@ share the native-messaging host at the user-data-dir level
 so the host installed for the everyday profile already covers this one and there
 is nothing extra to register. `clawster browser init` creates and opens it.
 
+**Picking the right browser is not automatic.** `list_connected_browsers` labels
+devices `Browser 1`, `Browser 2`, … with no indication of which Chrome profile
+each one is, and an agent that acts without choosing gets whichever the harness
+picks. The name a human types during the `switch_browser` pairing flow is scoped
+to that session and never reaches the listing, so it cannot identify a browser
+to a later `claude -p` wake.
+
+The durable handle is the device id the extension stores per profile, under
+`bridgeDeviceId` in that profile's extension storage. `clawster browser status`
+reads it and prints the mapping — that is the source of truth, because the ids
+can change if the extension re-registers:
+
+```
+Profile → browser device id (for select_browser):
+  Default      70a748f6-37bf-42c0-97c6-92d3bc4ef123
+  Clawster     bfb0bb73-9d30-4731-9760-5b2926a5e486  ← agents use this one
+```
+
+An agent with browser access must call `select_browser` with the **Clawster**
+id before its first browser action. Use `select_browser`, not `switch_browser`
+— the latter broadcasts a pairing request and waits up to two minutes for a
+human to click Connect, which never happens on a scheduled wake.
+
+A third id may appear in the listing that maps to no profile on disk. Those are
+stale registrations from a browser that no longer exists; ignore them.
+
+**The tab tools cannot read existing tabs.** `tabs_context_mcp` reports only the
+tab group the session itself created, not what the human has open. So an agent
+cannot enumerate or read Chris's browsing. The blast radius is authenticated
+*navigation* — the profile's cookies apply to sites the agent visits — which is
+what the dedicated profile contains.
+
 **Two things that will bite:**
 
 - **Chrome must actually be running.** `list_connected_browsers` reports a

@@ -1,6 +1,6 @@
 import { Command } from "commander";
 import { spawn } from "child_process";
-import { existsSync } from "fs";
+import { existsSync, readdirSync, readFileSync } from "fs";
 import { readFile, mkdir } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
@@ -57,6 +57,60 @@ function extensionInstalledIn(profile: string): boolean {
   return existsSync(join(chromeUserDataDir(), profile, "Extensions", EXTENSION_ID));
 }
 
+/**
+ * The device id the extension registered for a Chrome profile.
+ *
+ * `list_connected_browsers` names devices "Browser 1", "Browser 2", … with no
+ * hint as to which profile each one is. The name a user types during the
+ * `switch_browser` pairing flow is scoped to that session and never appears in
+ * the listing, so it cannot identify a browser to a later `claude -p` run.
+ *
+ * The extension does store its own id per profile, under `bridgeDeviceId` in
+ * the profile's extension storage. Reading it here turns an opaque UUID list
+ * into a profile mapping, so an agent can `select_browser` the right one
+ * deterministically instead of taking whichever is first.
+ *
+ * Best-effort: the storage is LevelDB and we scan it rather than parse it. A
+ * miss returns null and the caller degrades to showing nothing.
+ */
+function bridgeDeviceId(profile: string): string | null {
+  const dir = join(chromeUserDataDir(), profile, "Local Extension Settings", EXTENSION_ID);
+  if (!existsSync(dir)) return null;
+  const uuid = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/;
+  let latest: string | null = null;
+  for (const name of readdirSync(dir)) {
+    let blob: string;
+    try {
+      blob = readFileSync(join(dir, name), "latin1");
+    } catch {
+      continue;
+    }
+    // Take the LAST match in the file: LevelDB appends, so a rewritten id
+    // leaves the stale one earlier in the log.
+    let idx = blob.lastIndexOf("bridgeDeviceId");
+    while (idx !== -1) {
+      const m = uuid.exec(blob.slice(idx, idx + 120));
+      if (m) {
+        latest = m[0];
+        break;
+      }
+      idx = blob.lastIndexOf("bridgeDeviceId", idx - 1);
+    }
+    if (latest) break;
+  }
+  return latest;
+}
+
+/** Chrome profile directories that actually exist, Default first. */
+function chromeProfiles(): string[] {
+  const base = chromeUserDataDir();
+  if (!existsSync(base)) return [];
+  return readdirSync(base, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && existsSync(join(base, e.name, "Preferences")))
+    .map((e) => e.name)
+    .sort((a, b) => (a === "Default" ? -1 : b === "Default" ? 1 : a.localeCompare(b)));
+}
+
 function findChromeBinary(): string | null {
   if (process.env.CLAWSTER_CHROME_BIN && existsSync(process.env.CLAWSTER_CHROME_BIN)) {
     return process.env.CLAWSTER_CHROME_BIN;
@@ -103,6 +157,16 @@ browserCommand
     console.log(`  Extension (Default):${extensionInstalledIn("Default") ? " installed" : " not installed"}`);
     console.log(`  Extension (${PROFILE_DIR}): ${extensionInstalledIn(PROFILE_DIR) ? "installed" : "NOT INSTALLED — run: clawster browser init"}`);
     console.log(`  Agent profile dir:  ${join(chromeUserDataDir(), PROFILE_DIR)}`);
+
+    // The mapping agents need. `list_connected_browsers` shows these ids under
+    // meaningless labels ("Browser 1"), so print which profile owns each.
+    console.log("\n  Profile → browser device id (for select_browser):");
+    for (const prof of chromeProfiles()) {
+      const id = bridgeDeviceId(prof);
+      if (!id) continue;
+      const mark = prof === PROFILE_DIR ? "  ← agents use this one" : "";
+      console.log(`    ${prof.padEnd(12)} ${id}${mark}`);
+    }
 
     console.log(`\n  Agents with browser access (${granted.length}/${agents.length}):`);
     if (granted.length === 0) {
