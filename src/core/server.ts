@@ -146,6 +146,7 @@ export async function startServer() {
     const supervisor = new OrchestratorSupervisor({
       tmuxSession: o.tmuxSession,
       channelServer: o.channelServer,
+      chrome: o.chrome,
       ...(o.cwd ? { cwd: o.cwd } : {}),
       ...(o.stateDir ? { stateDir: o.stateDir } : {}),
     });
