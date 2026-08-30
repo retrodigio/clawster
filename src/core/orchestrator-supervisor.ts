@@ -38,6 +38,10 @@ export interface OrchestratorSupervisorOptions {
   channelServer: string;
   /** Pass `--chrome` so the session gets the native Chrome integration. */
   chrome: boolean;
+  /** `--model` for the orchestrator session. Empty = inherit user settings. */
+  model: string;
+  /** `--effort` for the orchestrator session. Empty = inherit user settings. */
+  effort: string;
   /** Where recovery manifests are written. */
   recoveryDir: string;
   config?: SupervisorConfig;
@@ -60,6 +64,8 @@ export function defaultOptions(): OrchestratorSupervisorOptions {
     stateDir: join(homedir(), ".claude", "channels", "telegram"),
     channelServer: "telegram-channel",
     chrome: true,
+    model: "sonnet",
+    effort: "low",
     recoveryDir: join(process.env.CLAWSTER_HOME ?? join(homedir(), ".clawster"), "recovery"),
   };
 }
@@ -306,7 +312,14 @@ export class OrchestratorSupervisor {
     const cmd = [
       "tmux", "new-session", "-d", "-s", this.opts.tmuxSession,
       "-x", "220", "-y", "50", "-c", this.opts.cwd,
-      `claude${this.opts.chrome ? " --chrome" : ""} --dangerously-load-development-channels server:${this.opts.channelServer} --dangerously-skip-permissions`,
+      [
+        "claude",
+        ...(this.opts.model ? ["--model", this.opts.model] : []),
+        ...(this.opts.effort ? ["--effort", this.opts.effort] : []),
+        ...(this.opts.chrome ? ["--chrome"] : []),
+        `--dangerously-load-development-channels server:${this.opts.channelServer}`,
+        "--dangerously-skip-permissions",
+      ].join(" "),
     ];
     const r = await this.opts.exec(cmd);
     if (r.code !== 0) {

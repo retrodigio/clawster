@@ -147,6 +147,8 @@ export async function startServer() {
       tmuxSession: o.tmuxSession,
       channelServer: o.channelServer,
       chrome: o.chrome,
+      model: o.model,
+      effort: o.effort,
       ...(o.cwd ? { cwd: o.cwd } : {}),
       ...(o.stateDir ? { stateDir: o.stateDir } : {}),
     });

@@ -201,7 +201,10 @@ describe("buildRecoveryManifest", () => {
 });
 
 describe("orchestrator spawn — chrome flag", () => {
-  async function spawnCmd(chrome: boolean): Promise<string[]> {
+  async function spawnCmd(
+    chrome: boolean,
+    over: { model?: string; effort?: string } = {},
+  ): Promise<string[]> {
     const { OrchestratorSupervisor, defaultOptions } = await import(
       "../src/core/orchestrator-supervisor.ts"
     );
@@ -209,6 +212,7 @@ describe("orchestrator spawn — chrome flag", () => {
     const sup = new OrchestratorSupervisor({
       ...defaultOptions(),
       chrome,
+      ...over,
       exec: async (cmd: string[]) => {
         if (cmd[1] === "new-session") captured = cmd;
         return { code: 0, stdout: "" };
@@ -223,13 +227,56 @@ describe("orchestrator spawn — chrome flag", () => {
     // `claude --chrome` is replaced by this command on the next restart.
     // If the flag is not here, browser tools vanish mid-thread with no error.
     const cmd = await spawnCmd(true);
-    expect(cmd.at(-1)).toContain("claude --chrome ");
+    expect(cmd.at(-1)).toContain("--chrome");
     expect(cmd.at(-1)).toContain("--dangerously-load-development-channels");
   });
 
   test("chrome:false omits it without mangling the rest", async () => {
-    const cmd = await spawnCmd(false);
+    const cmd = await spawnCmd(false, { model: "", effort: "" });
     expect(cmd.at(-1)).not.toContain("--chrome");
     expect(cmd.at(-1)).toStartWith("claude --dangerously-load-development-channels");
+  });
+});
+
+describe("orchestrator spawn — model and effort", () => {
+  async function cmd(over: { model?: string; effort?: string }): Promise<string> {
+    const { OrchestratorSupervisor, defaultOptions } = await import(
+      "../src/core/orchestrator-supervisor.ts"
+    );
+    let captured: string[] = [];
+    const sup = new OrchestratorSupervisor({
+      ...defaultOptions(),
+      ...over,
+      exec: async (c: string[]) => {
+        if (c[1] === "new-session") captured = c;
+        return { code: 0, stdout: "" };
+      },
+    });
+    await sup.startOrchestrator(1);
+    return captured.at(-1) ?? "";
+  }
+
+  test("defaults pin the session to sonnet at low effort", async () => {
+    // Routing is a lookup, not reasoning. Left unpinned the session inherits
+    // the operator's personal ~/.claude/settings.json, which measured 9-63s
+    // per dispatch at opus/high.
+    const c = await cmd({});
+    expect(c).toContain("--model sonnet");
+    expect(c).toContain("--effort low");
+  });
+
+  test("empty strings mean inherit, not an empty flag", async () => {
+    // A bare `--model` with no value would make claude refuse to start, which
+    // the supervisor would then see as a session that will not come up.
+    const c = await cmd({ model: "", effort: "" });
+    expect(c).not.toContain("--model");
+    expect(c).not.toContain("--effort");
+    expect(c).toContain("--dangerously-load-development-channels");
+  });
+
+  test("flags precede the channel arg so they are not swallowed by it", async () => {
+    const c = await cmd({ model: "opus", effort: "high" });
+    expect(c.indexOf("--model")).toBeLessThan(c.indexOf("--dangerously-load"));
+    expect(c).toStartWith("claude --model opus --effort high");
   });
 });
