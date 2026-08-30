@@ -37,7 +37,7 @@ src/
     logs.ts               # clawster logs
     agent.ts              # clawster agent add|list|remove|discover
     workspace.ts          # clawster workspace init
-    browser.ts            # clawster browser init|status|chrome
+    browser.ts            # clawster browser init|status|grant|revoke
     daemon.ts             # clawster daemon install|uninstall
     migrate.ts            # clawster migrate (from OpenClaw)
   core/
@@ -62,7 +62,7 @@ src/
     web-api.ts            # Local HTTP API + dashboard backend (loopback only)
 config/
   agents.json             # Agent definitions (development/reference copy)
-  mcp-servers.json        # MCP server registry (open-brain + restricted servers like playwright)
+  mcp-servers.json        # MCP server registry (open-brain; restricted-server ACL)
 daemon/
   com.claude.open-brain.plist  # launchd plist for the Open Brain MCP server
 scripts/
@@ -317,7 +317,14 @@ All MCP servers live in `config/mcp-servers.json`. Each entry may carry an optio
 - **Non-restricted servers** (e.g. `open-brain`) are attached to every agent automatically.
 - **Restricted servers** are only attached to agents that explicitly opt-in via `agents.json` → `mcpServers: ["server-name"]`.
 
-Today the only restricted server is `playwright`, because the dedicated debug Chrome it drives accumulates authenticated logins. Granting an agent `playwright` means that agent can navigate, click, and screenshot any site you've logged into in the debug profile — so grant it deliberately, not fleet-wide.
+**No server is currently marked restricted.** `playwright` used to be, because
+the debug Chrome it drove accumulated authenticated logins — that whole design
+is retired (see below), and the entry was removed rather than left in place
+implying a working path. The ACL itself stays: it is enforced in
+`agent-runner.ts`, and the next restricted server gets it for free.
+
+Browser access is no longer an MCP grant at all. It is a per-agent CLI flag —
+see the next section.
 
 ### Browser access (Claude in Chrome)
 
