@@ -73,7 +73,7 @@ export async function saveEnvVar(key: string, value: string): Promise<void> {
 
 // Model per mode.
 //   conversation   -> opus            (front-facing orchestrator chat)
-//   planning       -> claude-fable-5  (deep reasoning / plan authoring)
+//   planning       -> claude-fable-5-1  (deep reasoning / plan authoring)
 //   implementation -> sonnet          (agentic coding / subagent work)
 // NOTE: `opus` and `sonnet` are CLI aliases and refresh automatically. `fable`
 // is pinned to its full model ID because SDK 0.2.x does not recognize the
@@ -82,7 +82,7 @@ export async function saveEnvVar(key: string, value: string): Promise<void> {
 // later before switching this back to the bare alias.
 export const DEFAULT_MODELS = {
   conversation: "opus",
-  planning: "claude-fable-5",
+  planning: "claude-fable-5-1",
   implementation: "sonnet",
 } as const;
 
