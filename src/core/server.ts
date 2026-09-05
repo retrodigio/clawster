@@ -12,6 +12,7 @@ import { startScheduler } from "./scheduler.ts";
 import { walPending, walDone } from "./message-wal.ts";
 import { resolveAgentModel } from "./model-resolver.ts";
 import { OrchestratorSupervisor } from "./orchestrator-supervisor.ts";
+import { sweepOrphanedSdkProcesses } from "./orphan-sweep.ts";
 
 export async function startServer() {
   const lockAcquired = await acquireLock();
@@ -19,6 +20,11 @@ export async function startServer() {
     log.error("orchestrator", "Failed to acquire lock — another instance may be running");
     process.exit(1);
   }
+
+  // Safe only here: the lock we just took proves no other daemon of this
+  // install is live, and we have spawned nothing yet, so any SDK process still
+  // parented to PID 1 is debris from a previous death rather than live work.
+  await sweepOrphanedSdkProcesses();
 
   const { config, agents, chatIdToAgent, agentById, defaultAgent } = await initConfigStore();
   const apiToken = await loadApiToken();
