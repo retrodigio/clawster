@@ -75,15 +75,50 @@ the published piece or runs the repo.
 
 ## Model split
 
-| Role | Mode | Model | Why |
-|---|---|---|---|
-| Lead (writes the prompt, sequences the work) | `conversation` | opus | It makes the coupling call, and that call is worth more than the tokens it costs |
-| Builder | `implementation` | sonnet | Volume role. Most of the tokens in the run are here |
-| Critic | `conversation` | opus | The critic's judgment is the quality ceiling of the entire loop, and it is cheap — few calls, short outputs |
+| Role | Model | Why |
+|---|---|---|
+| Lead — writes the prompt, picks the bar, makes the coupling call, sequences | **Fable 5.1 if offered and accepted, otherwise Opus 5** | Three low-volume, high-leverage decisions. Deep reasoning is worth more here than anywhere else in the run, and the lead spends few tokens making it |
+| Builder | **Sonnet 5** | Volume role. Most of the tokens in the run are here, and the work is execution against a critic's named gap rather than open judgment |
+| Critic | **Opus 5** | The critic's judgment is the quality ceiling of the entire loop, and it is the cheap role: few calls, short outputs |
 
-Modes map to models in `~/.clawster/config.json` → `models`. Do not put critics on
-sonnet to save money: a soft critic converges the loop on nothing, and you pay for
-the rounds anyway.
+Offer the lead's model **before the first spawn**, in one line: "Run the lead on
+Fable 5.1? Otherwise Opus 5." Default to Opus 5 on no answer. Switching the lead
+mid-run throws away the context holding the coupling call, which is the one thing
+the lead exists to produce.
+
+### Naming the model is not optional
+
+**Subagents inherit the lead's model when the spawn does not name one.** So a
+Fable lead silently produces Fable builders and Fable critics — at Fable prices,
+across every round, with nothing in the output saying so. This is not
+hypothetical: pinning the orchestrator session's model in commit `3357bef` did
+exactly this to every subagent in the fleet, was invisible until someone asked a
+direct question about it, and was reverted in `377d1a8`.
+
+Name the model on **every** spawn, even when it matches what you think you are
+inheriting:
+
+- **In a Claude Code session** — the `Agent` tool's `model` parameter, which takes
+  the line aliases `opus`, `sonnet`, `haiku`, `fable`. Bare `fable` resolves to
+  Fable 5.1; full ids like `claude-fable-5-1` work where a `--model` flag is
+  accepted, but the `Agent` parameter wants the alias.
+- **In a Clawster Telegram thread** — modes map to models in
+  `~/.clawster/config.json` → `models`, and `/convo` (Opus), `/plan` or `/fable`
+  (Fable 5.1), `/build` (Sonnet) switch the calling chat. `/status` reports the
+  active mode and the resolved model, which is the only way to confirm what you
+  are actually running rather than what you meant to run.
+
+### What this buys, and what it does not
+
+A cheaper builder tier reduces subscription burn per round, so a long run reaches
+its usage limits later. It does **not** lengthen a run on its own: the ceiling is
+still 4 rounds or 45 minutes per piece, `maxConcurrent` is still 4, and neither
+moves because the models changed. Longer loops come from raising the ceiling
+deliberately (`references/budget.md`), which is Chris's call and not the lead's.
+
+Do not put critics on sonnet to save money. A soft critic converges the loop on
+nothing and you pay for the rounds anyway — Claude-of-Duty's critic scores drifted
+3.59 → 5.05 while every critic still picked the real game over the build.
 
 ## Concurrency
 

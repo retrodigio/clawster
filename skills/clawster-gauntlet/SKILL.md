@@ -32,9 +32,15 @@ see `NOTICE.md` for attribution and the exact diff against upstream.
    it, no narration after it.
 6. **Offer to run it.** One flat line under the prompt: "I can run this here."
    Not a question.
+7. **Offer Fable for the lead — before starting, not after.** If they say run it,
+   ask once, in one line: "Run the lead on Fable 5.1? Otherwise Opus 5." Default
+   to Opus 5 if they do not answer or do not care. Ask before the first spawn,
+   because switching the lead mid-run resets the context that holds the coupling
+   call.
 
 If they say run it, you become the lead agent and follow the prompt you just wrote.
-Read `references/running-in-the-fleet.md` before you do.
+Read `references/running-in-the-fleet.md` before you do — the model split there is
+not optional, and getting it wrong is silent.
 
 ## The bar is the whole trick
 
@@ -101,7 +107,8 @@ against a description of it.
 
 Split this into the smallest pieces that can be improved and judged on their own.
 [SEPARABLE PIECES] are independent — fan out a builder and a separate critic on
-each. [COUPLED CONCERNS] share global state and get one sequential owner instead,
+each, naming the model on every spawn: builders on sonnet, critics on opus.
+[COUPLED CONCERNS] share global state and get one sequential owner instead,
 not parallel agents.
 
 Each critic is a separate agent with fresh context. It inspects the actual output,
@@ -133,8 +140,9 @@ Rules for what you fill in:
 
 ## Length and voice
 
-Short. Around 150 to 200 words — the fork's budget and coupling lines cost about
-40 words over upstream, and that is the whole overrun. If the prompt needs a
+Short. Around 200 to 215 words — upstream targets 150, and the fork's three
+structural additions account for the whole overrun: the budget line, the coupling
+line, and the model-naming clause. Nothing else earns words. If the prompt needs a
 heading to stay readable, it is too long.
 
 Plain sentences. No bullet lists inside the prompt. It should read like someone
@@ -167,7 +175,8 @@ those directly, not against a description of them.
 
 Split this into pieces that can be judged on their own — entry, hold, exit,
 type treatment, and touch response. Those five are independent; fan out a builder
-and a separate critic on each. Easing curves and the shared motion tokens are one
+and a separate critic on each, naming the model on every spawn: builders on
+sonnet, critics on opus. Easing curves and the shared motion tokens are one
 coupled system across all five, so give those a single sequential owner and let
 that owner land first.
 
@@ -201,6 +210,9 @@ I can run this here.
   a non-visual bar instead of pretending.
 - **The builder judging its own work.** The critic must be a separate agent with
   fresh context. It should not know how hard the builder tried.
+- **Spawning without naming a model.** Subagents inherit the lead's model. A Fable
+  lead silently produces Fable builders and Fable critics, at Fable prices, and
+  nothing in the output says so. Name the model on every spawn.
 - **A soft critic.** Say "harsh" and give it a binary job. Scores out of 10 drift
   upward every round — Claude-of-Duty's went 3.59 → 5.05 while every critic still
   picked the real game.
