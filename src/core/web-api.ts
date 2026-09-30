@@ -8,6 +8,8 @@ import {
   type LoadedConfig,
 } from "./config.ts";
 import { mutateAgents } from "./config-store.ts";
+import { checkAgentTask, upsertTask, removeTask, describeTaskChange, MAX_TASKS_PER_AGENT } from "./task-policy.ts";
+import { sendTelegram } from "./scheduler.ts";
 import { getSession, clearSession } from "./session-store.ts";
 import type { AgentConfig } from "./types.ts";
 import type { ActivityStatus, ConversationEvent, QueryPriority } from "./agent-runner.ts";
@@ -77,6 +79,25 @@ export function startWebApi(options: WebApiOptions) {
   const { port, runner, apiToken } = options;
   let currentConfig = options.getConfig;
   const reloadConfig = options.reloadConfig;
+
+  /**
+   * Post a schedule change to the agent's own group as a NEW message — edits
+   * don't notify, and the point is that Chris sees it. A failed notice never
+   * fails the change: the schedule is already saved, so log and move on.
+   */
+  async function announceTaskChange(
+    agent: AgentConfig,
+    action: "added" | "updated" | "removed",
+    task: Parameters<typeof describeTaskChange>[2],
+  ): Promise<void> {
+    try {
+      const botToken = currentConfig().config.botToken;
+      const sent = await sendTelegram(botToken, agent.telegramChatId, describeTaskChange(agent, action, task));
+      if (!sent.ok) log.warn("web-api", "Task change notice not delivered", { agent: agent.id, task: task.name });
+    } catch (e) {
+      log.warn("web-api", "Task change notice failed", { agent: agent.id, error: String(e) });
+    }
+  }
 
   /** Check Bearer token from Authorization header. */
   function checkBearerAuth(req: Request): boolean {
@@ -375,6 +396,72 @@ export function startWebApi(options: WebApiOptions) {
         return withCors(err(`Invalid agent config: ${e instanceof Error ? e.message : e}`, 400));
       }
       return withCors(json(newAgent, 201));
+    }
+
+    // /api/agents/:id/tasks[/:name] — an agent managing its OWN schedule.
+    //
+    // Deliberately narrower than PATCH /api/agents/:id below: it can only touch
+    // `tasks`, and every write is checked by task-policy.ts (own chat only, a
+    // run-frequency ceiling, a per-agent cap) and announced in the agent's own
+    // Telegram group. This is the path `clawster task` uses, and the only
+    // registry change conduct.md permits an agent to make. See task-policy.ts.
+    const taskRoute = path.match(/^\/api\/agents\/([^/]+)\/tasks(?:\/([^/]+))?$/);
+    if (taskRoute) {
+      const id = decodeURIComponent(taskRoute[1]!);
+      const name = taskRoute[2] ? decodeURIComponent(taskRoute[2]) : undefined;
+      const cfg = currentConfig();
+      const agent = cfg.agents.agents.find((a) => a.id === id);
+      if (!agent) return withCors(err("Agent not found", 404));
+
+      if (method === "GET" && !name) {
+        return withCors(json({ agentId: id, tasks: agent.tasks ?? [] }));
+      }
+
+      if (method === "PUT" && name) {
+        const body = await parseBody<Record<string, unknown>>(req);
+        if (!body) return withCors(err("Invalid body"));
+        const check = checkAgentTask(agent, { ...body, name });
+        if (!check.ok) return withCors(err(check.error, 400));
+
+        const exists = (agent.tasks ?? []).some((t) => t.name === name);
+        if (!exists && (agent.tasks?.length ?? 0) >= MAX_TASKS_PER_AGENT) {
+          return withCors(err(`${id} already has ${MAX_TASKS_PER_AGENT} tasks, the limit. Remove one first.`, 400));
+        }
+
+        let replaced = false;
+        try {
+          await mutateAgents((agents) => {
+            const a = agents.agents.find((x) => x.id === id);
+            if (!a) return;
+            const result = upsertTask(a.tasks, check.task);
+            a.tasks = result.tasks;
+            replaced = result.replaced;
+          });
+        } catch (e) {
+          return withCors(err(`Could not save task: ${e instanceof Error ? e.message : e}`, 400));
+        }
+        const action = replaced ? "updated" : "added";
+        await announceTaskChange(agent, action, check.task);
+        log.info("web-api", `Task ${action}`, { agent: id, task: name, schedule: check.task.schedule });
+        return withCors(json({ agentId: id, action, task: check.task }));
+      }
+
+      if (method === "DELETE" && name) {
+        let removed = false;
+        await mutateAgents((agents) => {
+          const a = agents.agents.find((x) => x.id === id);
+          if (!a) return;
+          const result = removeTask(a.tasks, name);
+          a.tasks = result.tasks.length ? result.tasks : undefined;
+          removed = result.removed;
+        });
+        if (!removed) return withCors(err(`${id} has no task named '${name}'`, 404));
+        await announceTaskChange(agent, "removed", { name, schedule: "" });
+        log.info("web-api", "Task removed", { agent: id, task: name });
+        return withCors(json({ agentId: id, action: "removed", name }));
+      }
+
+      return withCors(err("Use GET …/tasks, PUT …/tasks/:name, or DELETE …/tasks/:name", 405));
     }
 
     // PUT/PATCH /api/agents/:id — update agent (web client sends PATCH)

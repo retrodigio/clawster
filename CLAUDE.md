@@ -95,6 +95,7 @@ templates/                # Templates for new workspace CLAUDE.md files
 | `clawster browser status` | Check extension, native host, Chrome, and who has access |
 | `clawster browser grant <agentId>` | Give an agent browser access (`--chrome`) |
 | `clawster browser revoke <agentId>` | Remove an agent's browser access |
+| `clawster task list\|set\|add\|remove <agentId>` | Manage an agent's scheduled tasks (live, no restart) |
 
 ## Config Structure
 
@@ -225,6 +226,44 @@ the running orchestrator itself hot-reload — no restart needed.)
 3. Run `clawster agent discover`
 4. Send a message in the group — the chat ID will appear in the terminal
 5. Press Ctrl+C when done
+
+## Agent-managed schedules
+
+An agent may set, change, and remove its **own** scheduled tasks with
+`clawster task`. It is the one registry change an agent may make; everything
+else in `agents.json` (browser grants, restricted MCP servers, chat bindings,
+workspaces) stays terminal-only, per `conduct.md` §7.
+
+```
+clawster task list lettergnome
+clawster task set  lettergnome tasks.json          # object, array, or {"tasks": [...]}
+clawster task add  lettergnome -n nightly -s "15 0 * * *" -f prompt.md -t 30
+clawster task remove lettergnome nightly
+```
+
+The CLI calls `GET|PUT|DELETE /api/agents/:id/tasks[/:name]` on the daemon rather
+than writing `agents.json`, because a direct file edit never reaches the running
+daemon's in-memory config. The scheduler re-reads tasks every tick, so changes
+apply within a minute.
+
+Limits are enforced in the daemon (`src/core/task-policy.ts`), not in the agent's
+instructions, because an agent that reads the open web can be talked into things:
+
+| Limit | Why |
+|---|---|
+| A task posts only to its own agent's chat | `telegramChatId` would otherwise let an agent schedule messages into any group the bot is in — including the family agents' |
+| At most 48 runs/day per task (every 30 min) | Runs share the 4-slot semaphore and can last an hour; `* * * * *` would starve the fleet |
+| At most 10 tasks per agent | Same reason, summed |
+| Timeout 1-60 min | Inherited from `TaskSchema` |
+
+Every change is posted as a **new** message in the agent's own group, so a
+schedule an agent gave itself is never invisible.
+
+**What this does not do:** the API token in `~/.clawster/api-token` is shared,
+and the older `PATCH /api/agents/:id` still accepts any field. So "own schedule
+only" is enforced by `conduct.md`, not by identity — a determined agent could
+still call the broad route. Closing that needs per-agent tokens; the task route
+exists so the permitted path is the easy one.
 
 ## Heartbeats
 

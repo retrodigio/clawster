@@ -245,7 +245,7 @@ function isValidCronField(field: string): boolean {
   return /^(\*|\d+(-\d+)?)([,/](\*|\d+(-\d+)?))*$/.test(field);
 }
 
-function isValidCronExpression(expr: string): boolean {
+export function isValidCronExpression(expr: string): boolean {
   const fields = expr.trim().split(/\s+/);
   if (fields.length !== 5) return false;
   return fields.every(isValidCronField);

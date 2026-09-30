@@ -184,7 +184,7 @@ function heartbeatToCron(every: string, activeHours?: { start: string; end: stri
  * while the id is unrecoverable (unparseable response body). Delivered but
  * unciteable is a degradation, not a failure — don't conflate the two.
  */
-async function sendTelegram(
+export async function sendTelegram(
   botToken: string,
   chatId: string,
   text: string,
