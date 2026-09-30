@@ -33,8 +33,8 @@ see `NOTICE.md` for attribution and the exact diff against upstream.
 6. **Offer to run it.** One flat line under the prompt: "I can run this here."
    Not a question.
 7. **Offer Fable for the lead — before starting, not after.** If they say run it,
-   ask once, in one line: "Run the lead on Fable 5.1? Otherwise Opus 5." Default
-   to Opus 5 if they do not answer or do not care. Ask before the first spawn,
+   ask once, in one line: "Run the lead on Fable 5.1? Otherwise Opus 5.5." Default
+   to Opus 5.5 if they do not answer or do not care. Ask before the first spawn,
    because switching the lead mid-run resets the context that holds the coupling
    call.
 

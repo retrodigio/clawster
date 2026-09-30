@@ -77,12 +77,12 @@ the published piece or runs the repo.
 
 | Role | Model | Why |
 |---|---|---|
-| Lead — writes the prompt, picks the bar, makes the coupling call, sequences | **Fable 5.1 if offered and accepted, otherwise Opus 5** | Three low-volume, high-leverage decisions. Deep reasoning is worth more here than anywhere else in the run, and the lead spends few tokens making it |
-| Builder | **Sonnet 5** | Volume role. Most of the tokens in the run are here, and the work is execution against a critic's named gap rather than open judgment |
-| Critic | **Opus 5** | The critic's judgment is the quality ceiling of the entire loop, and it is the cheap role: few calls, short outputs |
+| Lead — writes the prompt, picks the bar, makes the coupling call, sequences | **Fable 5.1 if offered and accepted, otherwise Opus 5.5** | Three low-volume, high-leverage decisions. Deep reasoning is worth more here than anywhere else in the run, and the lead spends few tokens making it |
+| Builder | **Sonnet 5.5** | Volume role. Most of the tokens in the run are here, and the work is execution against a critic's named gap rather than open judgment |
+| Critic | **Opus 5.5** | The critic's judgment is the quality ceiling of the entire loop, and it is the cheap role: few calls, short outputs |
 
 Offer the lead's model **before the first spawn**, in one line: "Run the lead on
-Fable 5.1? Otherwise Opus 5." Default to Opus 5 on no answer. Switching the lead
+Fable 5.1? Otherwise Opus 5.5." Default to Opus 5.5 on no answer. Switching the lead
 mid-run throws away the context holding the coupling call, which is the one thing
 the lead exists to produce.
 
