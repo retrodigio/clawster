@@ -29,7 +29,15 @@ export const APP_CLI = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 export type Exec = (cmd: string[], timeoutMs?: number) => Promise<{ code: number; stdout: string; stderr: string }>;
 
 export async function defaultExec(cmd: string[], timeoutMs = 20_000) {
-  const p = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
+  // TAILSCALE_BE_CLI: Tailscale.app's bundled binary decides between "CLI" and
+  // "launch the GUI" from its environment. Under launchd (no TERM) it tries to
+  // start the GUI and prints an error instead of JSON — which read as "app
+  // down" on the first live tick. Forcing CLI mode is harmless for curl/dig.
+  const p = Bun.spawn(cmd, {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env, TAILSCALE_BE_CLI: "1" },
+  });
   const timer = setTimeout(() => p.kill(), timeoutMs);
   try {
     const [stdout, stderr] = await Promise.all([
