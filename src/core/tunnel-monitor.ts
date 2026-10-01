@@ -89,22 +89,24 @@ export class TunnelMonitor {
     }));
     let backend: string;
     let dnsName: string | undefined;
+    let keyExpiry: number | undefined;
     try {
-      ({ backend, dnsName } = parseStatusJson(st.stdout));
+      ({ backend, dnsName, keyExpiry } = parseStatusJson(st.stdout));
     } catch {
       // No JSON at all: the CLI could not reach the App / tailscaled.
       return { backend: "unreachable" };
     }
     if (dnsName) this.lastDnsName = dnsName;
     if (backend !== "Running" || !dnsName) return { backend, ...(dnsName ? { dnsName } : {}) };
+    const exp = keyExpiry !== undefined ? { keyExpiry } : {};
 
     const fs = await this.exec([this.cli, "funnel", "status", "--json"]).catch(() => ({
       code: 1, stdout: "", stderr: "",
     }));
     const funnelOk = funnelServesDaemon(fs.stdout, dnsName, this.opts.port, this.opts.funnelPath);
-    if (!funnelOk) return { backend, dnsName, funnelOk };
+    if (!funnelOk) return { backend, dnsName, funnelOk, ...exp };
 
-    return { backend, dnsName, funnelOk, probe: await this.probe(dnsName) };
+    return { backend, dnsName, funnelOk, ...exp, probe: await this.probe(dnsName) };
   }
 
   /**

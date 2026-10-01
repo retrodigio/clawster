@@ -95,6 +95,27 @@ describe("decideTunnel", () => {
     expect(run([nf, nf])[1]!.remedy).toBe("apply-funnel");
   });
 
+  test("warns ahead of key expiry, rate-limited, surviving recovery resets", () => {
+    const DAY = 86_400_000;
+    let state = initialTunnelState();
+    const at = (now: number, expiry: number) => {
+      const d = decideTunnel(now, { ...healthy, keyExpiry: expiry }, state);
+      state = d.state;
+      return d;
+    };
+    const expiry = 100 * DAY;
+    expect(at(80 * DAY, expiry).alert).toBeUndefined(); // 20 days out
+    expect(at(87 * DAY, expiry).alert).toContain("expires in 13 day(s)");
+    expect(at(88 * DAY, expiry).alert).toBeUndefined(); // within rewarn window
+    expect(at(90 * DAY, expiry).alert).toContain("expires in 10 day(s)");
+    // An outage + recovery in between must not re-arm the warning early.
+    state = decideTunnel(90 * DAY + 1, down, state).state;
+    state = decideTunnel(90 * DAY + 2, down, state).state;
+    const rec = decideTunnel(90 * DAY + 3, { ...healthy, keyExpiry: expiry }, state);
+    expect(rec.alert).toContain("serving again");
+    expect(rec.alert).not.toContain("expires");
+  });
+
   test("default config is the documented one", () => {
     expect(DEFAULT_TUNNEL_CONFIG.failuresBeforeAction).toBe(2);
   });
@@ -104,6 +125,8 @@ describe("parsers", () => {
   test("status --json", () => {
     expect(parseStatusJson(JSON.stringify({ BackendState: "Running", Self: { DNSName: HOST + "." } })))
       .toEqual({ backend: "Running", dnsName: HOST });
+    expect(parseStatusJson(JSON.stringify({ BackendState: "Running", Self: { DNSName: HOST, KeyExpiry: "2027-03-30T14:55:40Z" } })).keyExpiry)
+      .toBe(Date.parse("2027-03-30T14:55:40Z"));
     expect(parseStatusJson(JSON.stringify({ BackendState: "NeedsLogin", Self: {} })))
       .toEqual({ backend: "NeedsLogin" });
     expect(() => parseStatusJson("failed to connect to local Tailscale service")).toThrow();

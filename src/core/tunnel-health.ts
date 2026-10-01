@@ -38,6 +38,8 @@ export interface TunnelObservation {
   dnsName?: string;
   /** Funnel enabled on :443 with a handler proxying to the daemon. Undefined when not checked. */
   funnelOk?: boolean;
+  /** Node key expiry (epoch ms). Undefined when expiry is disabled or unknown. */
+  keyExpiry?: number;
   /** Result of fetching the public probe URL. Undefined when not attempted. */
   probe?: { ok: boolean; status?: number; error?: string };
 }
@@ -59,6 +61,10 @@ export interface TunnelHealthConfig {
   backoffMs: number[];
   /** Re-send an unchanged alert at most this often. */
   realertMs: number;
+  /** Warn this long before the node key expires (expiry logs the node out). */
+  keyExpiryWarnMs: number;
+  /** Repeat the expiry warning at most this often. */
+  keyExpiryRewarnMs: number;
 }
 
 export const DEFAULT_TUNNEL_CONFIG: TunnelHealthConfig = {
@@ -67,6 +73,8 @@ export const DEFAULT_TUNNEL_CONFIG: TunnelHealthConfig = {
   // so the ladder exists to keep the log readable, not to protect anything.
   backoffMs: [0, 300_000, 900_000, 3_600_000],
   realertMs: 6 * 3_600_000,
+  keyExpiryWarnMs: 14 * 86_400_000,
+  keyExpiryRewarnMs: 3 * 86_400_000,
 };
 
 export interface TunnelState {
@@ -79,6 +87,8 @@ export interface TunnelState {
   /** What we last told the operator about, and when. Cleared on recovery. */
   alertedProblem?: TunnelProblem;
   alertedAt?: number;
+  /** Last key-expiry warning. Survives recovery resets. */
+  expiryWarnedAt?: number;
 }
 
 export function initialTunnelState(): TunnelState {
@@ -170,15 +180,27 @@ export function decideTunnel(
   if (!problem) {
     const wasAlerted = prev.alertedProblem !== undefined;
     const since = prev.failingSince;
+    const state: TunnelState = initialTunnelState();
+    if (prev.expiryWarnedAt !== undefined) state.expiryWarnedAt = prev.expiryWarnedAt;
+    const parts: string[] = [];
+    if (wasAlerted) {
+      parts.push(`✅ Tailscale Funnel${host} is serving again` +
+        (since ? ` after ${minutes(now - since)} down` : "") + ".");
+    }
+    // Key expiry logs the node out — the exact failure that killed the IronRod
+    // pipeline for months. Warn ahead, since afterwards only a human can fix it.
+    if (obs.keyExpiry !== undefined && obs.keyExpiry - now <= config.keyExpiryWarnMs &&
+        (state.expiryWarnedAt === undefined || now - state.expiryWarnedAt >= config.keyExpiryRewarnMs)) {
+      const days = Math.max(0, Math.floor((obs.keyExpiry - now) / 86_400_000));
+      parts.push(`⏳ Tailscale node key${host} expires in ${days} day(s) (${new Date(obs.keyExpiry).toISOString().slice(0, 10)}). ` +
+        "When it does, the node logs out and every external hook stops. Re-authenticate it, or disable key expiry " +
+        "for this machine in the Tailscale admin console (Machines → ⋯ → Disable key expiry).");
+      state.expiryWarnedAt = now;
+    }
     return {
-      state: initialTunnelState(),
+      state,
       summary: since ? `healthy again after ${minutes(now - since)}` : "healthy",
-      ...(wasAlerted
-        ? {
-            alert: `✅ Tailscale Funnel${host} is serving again` +
-              (since ? ` after ${minutes(now - since)} down` : "") + ".",
-          }
-        : {}),
+      ...(parts.length ? { alert: parts.join("\n") } : {}),
     };
   }
 
@@ -234,10 +256,15 @@ export function decideTunnel(
 // --- Parsing helpers for Tailscale CLI JSON (kept here so they are testable) ---
 
 /** Pull BackendState and the node's DNS name out of `tailscale status --json`. */
-export function parseStatusJson(stdout: string): { backend: string; dnsName?: string } {
-  const j = JSON.parse(stdout) as { BackendState?: string; Self?: { DNSName?: string } };
+export function parseStatusJson(stdout: string): { backend: string; dnsName?: string; keyExpiry?: number } {
+  const j = JSON.parse(stdout) as { BackendState?: string; Self?: { DNSName?: string; KeyExpiry?: string } };
   const dns = j.Self?.DNSName?.replace(/\.$/, "");
-  return { backend: j.BackendState ?? "NoState", ...(dns ? { dnsName: dns } : {}) };
+  const exp = j.Self?.KeyExpiry ? Date.parse(j.Self.KeyExpiry) : NaN;
+  return {
+    backend: j.BackendState ?? "NoState",
+    ...(dns ? { dnsName: dns } : {}),
+    ...(Number.isFinite(exp) ? { keyExpiry: exp } : {}),
+  };
 }
 
 /**
