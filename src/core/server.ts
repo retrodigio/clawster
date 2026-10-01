@@ -13,6 +13,8 @@ import { walPending, walDone } from "./message-wal.ts";
 import { resolveAgentModel } from "./model-resolver.ts";
 import { OrchestratorSupervisor } from "./orchestrator-supervisor.ts";
 import { sweepOrphanedSdkProcesses } from "./orphan-sweep.ts";
+import { TunnelMonitor } from "./tunnel-monitor.ts";
+import { sendTelegram } from "./scheduler.ts";
 
 export async function startServer() {
   const lockAcquired = await acquireLock();
@@ -177,6 +179,41 @@ export async function startServer() {
     });
   }
 
+  // Tailscale Funnel supervision: external sites reach the hook endpoints
+  // through it, and when it died on 2026-06-22 nothing noticed for months.
+  let tunnelTimer: ReturnType<typeof setInterval> | undefined;
+  const t = config.tunnel;
+  if (t?.enabled) {
+    const monitor = new TunnelMonitor({
+      port: config.healthPort,
+      tailscalePath: t.tailscalePath,
+      funnelPath: t.funnelPath,
+      probePath: t.probePath,
+      probeViaPublicDns: t.probeViaPublicDns,
+      alert: async (text) => {
+        const chat = t.alertChatId || getConfig().config.allowedUserId;
+        const sent = await sendTelegram(getConfig().config.botToken, chat, text);
+        if (!sent.ok) throw new Error("Telegram sendMessage failed");
+      },
+    });
+    let running = false;
+    const tunnelTick = () => {
+      if (running) return; // a slow probe must not stack ticks
+      running = true;
+      monitor
+        .tick()
+        .then((summary) => {
+          if (summary !== "healthy") log.info("tunnel", "tick", { summary });
+        })
+        .catch((err) => log.error("tunnel", "tick failed", { error: String(err) }))
+        .finally(() => { running = false; });
+    };
+    // First check shortly after boot, once the web API is listening.
+    setTimeout(tunnelTick, 15_000);
+    tunnelTimer = setInterval(tunnelTick, t.pollSeconds * 1000);
+    log.info("tunnel", "Supervising Tailscale Funnel", { everySeconds: t.pollSeconds, funnelPath: t.funnelPath });
+  }
+
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return; // second signal while draining — ignore
@@ -193,6 +230,7 @@ export async function startServer() {
     // 2. Stop supervising before draining — otherwise a shutting-down daemon
     //    could observe the orchestrator and "helpfully" restart it on the way out.
     if (supervisorTimer) clearInterval(supervisorTimer);
+    if (tunnelTimer) clearInterval(tunnelTimer);
 
     // 3. Signal the runner to reject new queries
     runner.shutdown();

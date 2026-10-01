@@ -87,6 +87,32 @@ export interface AgentConfig {
    * without redefining implementation. Omitted = use the fleet defaults.
    */
   models?: Partial<ModelsConfig>;
+  /**
+   * Scoped webhooks external sites may call at
+   * `POST /api/hooks/agent/<id>/<hook.name>`. See hook-policy.ts.
+   */
+  hooks?: AgentHookConfig[];
+}
+
+export type HookParamType = "positiveInt" | "slug";
+
+export interface AgentHookConfig {
+  /** URL segment; lowercase letters, digits, dashes. */
+  name: string;
+  /** Env var (process env or ~/.clawster/env) holding this hook's bearer token. */
+  tokenEnv: string;
+  /** Prompt template; `{{param}}` is replaced by a validated param value. */
+  prompt: string;
+  /** Declared params and their types. Nothing else from the body is used. */
+  params?: Record<string, HookParamType>;
+  /** Default 30. */
+  maxPerHour?: number;
+  timeoutMs?: number;
+  /** Forum topic to post results into. */
+  topicId?: number;
+  /** Post the agent's final text to its chat unless it says NO_CHECKIN. Default true. */
+  postResult?: boolean;
+  enabled?: boolean;
 }
 
 export interface OrchestratorConfig {

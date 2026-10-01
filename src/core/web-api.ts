@@ -14,6 +14,18 @@ import { getSession, clearSession } from "./session-store.ts";
 import type { AgentConfig } from "./types.ts";
 import type { ActivityStatus, ConversationEvent, QueryPriority } from "./agent-runner.ts";
 import { renderMetrics, agentsConfigured, sessionsActive } from "./metrics.ts";
+import { readEnvFile } from "./config.ts";
+import {
+  DEFAULT_HOOK_MAX_PER_HOUR,
+  findHook,
+  HookRateLimiter,
+  hookTokenMatches,
+  MAX_HOOK_BODY_BYTES,
+  MIN_HOOK_TOKEN_LENGTH,
+  renderHookPrompt,
+  shouldPostHookResult,
+  validateHookParams,
+} from "./hook-policy.ts";
 
 type AgentRunner = {
   run: (
@@ -298,6 +310,18 @@ export function startWebApi(options: WebApiOptions) {
         return serveStatic(path);
       }
 
+      // Public hook surface — reachable through the Tailscale Funnel and
+      // authenticated per hook, NOT with the master token. Must sit before the
+      // master-token gate below.
+      if (path === "/api/hooks/ping" && req.method === "GET") {
+        return hookPing(url);
+      }
+      const scoped = path.match(/^\/api\/hooks\/agent\/([^/]+)\/([^/]+)$/);
+      if (scoped) {
+        if (req.method !== "POST") return withCors(err("Method not allowed", 405));
+        return handleScopedHook(req, decodeURIComponent(scoped[1]!), decodeURIComponent(scoped[2]!));
+      }
+
       // Auth check for /api/* endpoints (except /health and /api/auth/token)
       if (path.startsWith("/api/") && path !== "/api/auth/token") {
         if (!checkBearerAuth(req)) {
@@ -306,6 +330,91 @@ export function startWebApi(options: WebApiOptions) {
       }
 
       return handleApi(req, url, path);
+  }
+
+  /**
+   * Liveness for the tunnel monitor: echoes a caller nonce so a probe through
+   * the public Funnel URL proves it reached THIS daemon, not a proxy error page
+   * or a cache. Discloses nothing else.
+   */
+  function hookPing(url: URL): Response {
+    const n = url.searchParams.get("n") ?? "";
+    return json({ ok: true, service: "clawster-hooks", nonce: /^[a-f0-9]{1,32}$/.test(n) ? n : "" });
+  }
+
+  const hookLimiter = new HookRateLimiter();
+  const hooksInFlight = new Set<string>();
+
+  /** POST /api/hooks/agent/:agentId/:hook — see hook-policy.ts. */
+  async function handleScopedHook(req: Request, agentId: string, hookName: string): Promise<Response> {
+    const cfg = currentConfig();
+    const agent = cfg.agentById.get(agentId);
+    const hook = findHook(agent, hookName);
+    if (!agent || !hook) return withCors(err("Unknown hook", 404));
+    const key = `${agent.id}/${hook.name}`;
+
+    const expected = process.env[hook.tokenEnv] ?? (await readEnvFile())[hook.tokenEnv];
+    if (!expected || expected.length < MIN_HOOK_TOKEN_LENGTH) {
+      log.error("web-api", "Hook has no usable token — refusing all calls", { hook: key, tokenEnv: hook.tokenEnv });
+      return withCors(err("Hook not configured", 503));
+    }
+    if (!hookTokenMatches(req.headers.get("authorization"), expected)) {
+      log.warn("web-api", "Hook call with bad token", { hook: key });
+      return withCors(err("Unauthorized", 401));
+    }
+
+    const raw = await req.text().catch(() => "");
+    if (raw.length > MAX_HOOK_BODY_BYTES) return withCors(err("Body too large", 413));
+    let body: unknown;
+    try {
+      body = raw ? JSON.parse(raw) : {};
+    } catch {
+      return withCors(err("Invalid JSON body"));
+    }
+    const v = validateHookParams(hook, body);
+    if (!v.ok) return withCors(err(v.error));
+
+    // Single-flight: the downstream work drains a queue, so a run already in
+    // flight will see this item too. Checked before the rate limit so a burst
+    // during a run does not burn the hour's budget.
+    if (hooksInFlight.has(key)) {
+      log.info("web-api", "Hook coalesced into in-flight run", { hook: key, params: v.params });
+      return withCors(json({ ok: true, accepted: true, coalesced: true }, 202));
+    }
+    const retryAfter = hookLimiter.take(key, hook.maxPerHour ?? DEFAULT_HOOK_MAX_PER_HOUR, Date.now());
+    if (retryAfter > 0) {
+      const res = withCors(json({ error: "Rate limited", retryAfterSeconds: retryAfter }, 429));
+      res.headers.set("Retry-After", String(retryAfter));
+      return res;
+    }
+
+    let prompt: string;
+    try {
+      prompt = renderHookPrompt(agent, hook, v.params);
+    } catch (e) {
+      log.error("web-api", `Hook template error: ${e}`, { hook: key });
+      return withCors(err("Hook misconfigured", 500));
+    }
+
+    const runId = crypto.randomUUID().slice(0, 8);
+    hooksInFlight.add(key);
+    log.info("web-api", "Hook run started", { hook: key, runId, params: v.params });
+    runner
+      .run(agent, prompt, {
+        ...(hook.topicId ? { topicId: hook.topicId } : {}),
+        ...(hook.timeoutMs ? { timeout: hook.timeoutMs } : {}),
+      })
+      .then(async (text) => {
+        log.info("web-api", "Hook run finished", { hook: key, runId, chars: text.length });
+        if (hook.postResult !== false && shouldPostHookResult(text)) {
+          const sent = await sendTelegram(currentConfig().config.botToken, agent.telegramChatId, text, hook.topicId);
+          if (!sent.ok) log.warn("web-api", "Hook result not delivered to Telegram", { hook: key, runId });
+        }
+      })
+      .catch((e) => log.error("web-api", `Hook run failed: ${e}`, { hook: key, runId }))
+      .finally(() => hooksInFlight.delete(key));
+
+    return withCors(json({ ok: true, accepted: true, runId }, 202));
   }
 
   async function serveStatic(path: string): Promise<Response> {

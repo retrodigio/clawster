@@ -171,6 +171,33 @@ export const ClawsterConfigSchema = z.object({
     model: "",
     effort: "",
   }),
+
+  /**
+   * Tailscale Funnel supervision (tunnel-monitor.ts). External sites reach
+   * the daemon's hook endpoints through the Funnel; this keeps it serving and
+   * says so in Telegram when it can't.
+   */
+  tunnel: z.object({
+    enabled: z.boolean().default(true),
+    pollSeconds: z.number().int().min(30).max(3600).default(120),
+    /** Tailscale CLI path. Empty = Tailscale.app's bundled CLI, else `tailscale` on PATH. */
+    tailscalePath: z.string().default(""),
+    /** Path prefix the Funnel exposes. Only this is public — not the dashboard or the rest of /api. */
+    funnelPath: z.string().regex(/^\/.*\/$/).default("/api/hooks/"),
+    /** Unauthenticated nonce-echo endpoint, fetched through the public URL. */
+    probePath: z.string().default("/api/hooks/ping"),
+    probeViaPublicDns: z.boolean().default(true),
+    /** Alert destination. Empty = DM the allowed user. */
+    alertChatId: z.string().default(""),
+  }).default({
+    enabled: true,
+    pollSeconds: 120,
+    tailscalePath: "",
+    funnelPath: "/api/hooks/",
+    probePath: "/api/hooks/ping",
+    probeViaPublicDns: true,
+    alertChatId: "",
+  }),
 });
 
 export const HeartbeatSchema = z.object({
@@ -195,6 +222,18 @@ export const TaskSchema = z.object({
   // first IronRod assessment reconciled its whole KB and then lost its summary
   // to a 5-minute cap, so the durable work landed and the message did not.
   timeoutMs: z.number().int().min(60_000).max(3_600_000).optional(),
+});
+
+export const HookSchema = z.object({
+  name: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/, "lowercase letters, digits and dashes"),
+  tokenEnv: z.string().regex(/^[A-Z][A-Z0-9_]{2,127}$/, "an env var name like CLAWSTER_HOOK_X"),
+  prompt: z.string().min(1),
+  params: z.record(z.string().regex(/^[A-Za-z0-9_]{1,64}$/), z.enum(["positiveInt", "slug"])).optional(),
+  maxPerHour: z.number().int().min(1).max(600).optional(),
+  timeoutMs: z.number().int().min(60_000).max(3_600_000).optional(),
+  topicId: z.number().optional(),
+  postResult: z.boolean().optional(),
+  enabled: z.boolean().optional(),
 });
 
 export const AgentSchema = z.object({
@@ -232,6 +271,9 @@ export const AgentSchema = z.object({
     planning: z.string().optional(),
     implementation: z.string().optional(),
   }).optional(),
+  // Scoped webhooks (see hook-policy.ts). Modelled here so a registry write
+  // does not strip them — zod drops unknown keys.
+  hooks: z.array(HookSchema).optional(),
 });
 
 export const AgentsConfigSchema = z.object({
@@ -300,6 +342,17 @@ export interface ClawsterConfig {
   /** "bot" (default, unchanged behaviour) or "orchestrator". */
   mode: "bot" | "orchestrator";
   orchestrator: OrchestratorConfig;
+  tunnel: TunnelConfig;
+}
+
+export interface TunnelConfig {
+  enabled: boolean;
+  pollSeconds: number;
+  tailscalePath: string;
+  funnelPath: string;
+  probePath: string;
+  probeViaPublicDns: boolean;
+  alertChatId: string;
 }
 
 export interface AgentsConfig {
