@@ -14,6 +14,11 @@ import { randomBytes } from "crypto";
 import { log } from "./logger.ts";
 import {
   decideTunnel,
+  classifyTunnel,
+  discardUnconfirmedFailures,
+  evaluateWakeGrace,
+  parsePmsetLog,
+  type WakeGraceState,
   DEFAULT_TUNNEL_CONFIG,
   funnelServesDaemon,
   initialTunnelState,
@@ -66,6 +71,8 @@ export interface TunnelMonitorOptions {
   alert: (text: string) => Promise<void>;
   exec?: Exec;
   now?: () => number;
+  /** Tick interval, used to spot sleep gaps (> 2x). Default 60s. */
+  pollSeconds?: number;
   config?: TunnelHealthConfig;
 }
 
@@ -80,6 +87,7 @@ export class TunnelMonitor {
   private readonly now: () => number;
   private readonly cli: string;
   private lastDnsName?: string;
+  private wake: WakeGraceState = { graceUntil: 0 };
 
   constructor(private readonly opts: TunnelMonitorOptions) {
     this.exec = opts.exec ?? defaultExec;
@@ -167,10 +175,30 @@ export class TunnelMonitor {
     return `${r}: exit ${res.code}${out ? ` — ${out}` : ""}`;
   }
 
+  /** Latest power event from `pmset -g log`; undefined when unavailable. */
+  private async powerEvent() {
+    const r = await this.exec(["pmset", "-g", "log"], 15_000).catch(() => null);
+    return r && r.code === 0 ? parsePmsetLog(r.stdout) : undefined;
+  }
+
   async tick(): Promise<string> {
+    const now = this.now();
+    const g = evaluateWakeGrace(now, this.wake, (this.opts.pollSeconds ?? 60) * 1000, await this.powerEvent());
+    this.wake = g.state;
     const obs = await this.observe();
     if (!obs.dnsName && this.lastDnsName) obs.dnsName = this.lastDnsName;
-    const d = decideTunnel(this.now(), obs, this.state, this.opts.config ?? DEFAULT_TUNNEL_CONFIG);
+
+    // Post-wake grace / DarkWake: a failing reading is not evidence. Don't
+    // count it, alert on it, or remedy it. A healthy reading still flows
+    // through so recovery is reported normally.
+    if (g.quiet && classifyTunnel(obs)) {
+      this.state = discardUnconfirmedFailures(this.state);
+      const summary = "post-wake grace: ignoring failing reading";
+      if (g.fresh) log.info("tunnel", "post-wake grace", { reason: g.reason, graceSeconds: Math.round((this.wake.graceUntil - now) / 1000) });
+      return summary;
+    }
+
+    const d = decideTunnel(now, obs, this.state, this.opts.config ?? DEFAULT_TUNNEL_CONFIG);
     this.state = d.state;
 
     let remedyResult: string | undefined;

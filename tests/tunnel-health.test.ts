@@ -6,6 +6,10 @@ import {
   funnelServesDaemon,
   initialTunnelState,
   parseStatusJson,
+  detectSleepGap,
+  evaluateWakeGrace,
+  parsePmsetLog,
+  WAKE_GRACE_MS,
   type TunnelObservation,
   type TunnelState,
 } from "../src/core/tunnel-health.ts";
@@ -219,5 +223,109 @@ describe("TunnelMonitor (fake exec)", () => {
     const p = await m.probe(HOST);
     expect(p.ok).toBe(false);
     expect(p.status).toBe(200);
+  });
+});
+
+describe("sleep awareness", () => {
+  const IV = 60_000;
+
+  test("gap detection: strictly more than 2x the interval", () => {
+    expect(detectSleepGap(undefined, 1_000_000, IV)).toBe(false);
+    expect(detectSleepGap(1_000_000, 1_000_000 + IV, IV)).toBe(false);
+    expect(detectSleepGap(1_000_000, 1_000_000 + 2 * IV, IV)).toBe(false);
+    expect(detectSleepGap(1_000_000, 1_000_000 + 2 * IV + 1, IV)).toBe(true);
+    expect(detectSleepGap(1_000_000, 1_000_000 + 3_600_000, IV)).toBe(true);
+  });
+
+  test("grace opens on a gap, lasts ~3 min, logs fresh once", () => {
+    let st = evaluateWakeGrace(0, { graceUntil: 0 }, IV).state;
+    const a = evaluateWakeGrace(600_000, st, IV);
+    expect(a.quiet).toBe(true);
+    expect(a.fresh).toBe(true);
+    expect(a.reason).toBe("gap");
+    const b = evaluateWakeGrace(600_000 + IV, a.state, IV);
+    expect(b.quiet).toBe(true);
+    expect(b.fresh).toBe(false);
+    const c = evaluateWakeGrace(600_000 + 2 * IV, b.state, IV);
+    expect(c.quiet).toBe(true);
+    const d = evaluateWakeGrace(600_000 + 3 * IV + 1, c.state, IV); // grace is 3 min
+    expect(d.quiet).toBe(false);
+    expect(d.fresh).toBe(false);
+  });
+
+  test("DarkWake keeps it quiet; a stale DarkWake line does not", () => {
+    const now = 10_000_000;
+    const prev = { lastTickAt: now - IV, graceUntil: 0 };
+    expect(evaluateWakeGrace(now, prev, IV, { kind: "darkwake", at: now - 30_000 }).quiet).toBe(true);
+    expect(evaluateWakeGrace(now, prev, IV, { kind: "darkwake", at: now - 3_600_000 }).quiet).toBe(false);
+    expect(evaluateWakeGrace(now, prev, IV, { kind: "sleep", at: now - 1_000 }).quiet).toBe(false);
+    expect(evaluateWakeGrace(now, prev, IV, { kind: "wake", at: now - 60_000 }).quiet).toBe(true);
+    expect(evaluateWakeGrace(now, prev, IV, { kind: "wake", at: now - 600_000 }).quiet).toBe(false);
+  });
+
+  test("parsePmsetLog takes the latest Sleep/DarkWake/Wake and ignores Wake Requests", () => {
+    const out = [
+      "2026-10-06 11:39:02 -0600 DarkWake            \tDarkWake from Deep Idle",
+      "2026-10-06 11:39:47 -0600 Sleep               \tEntering Sleep state",
+      "2026-10-06 11:39:50 -0600 Wake Requests       \t[process=dasd]",
+      "2026-10-06 11:48:45 -0600 Wake                \tWake from Deep Idle",
+      "2026-10-06 11:49:00 -0600 Assertions          \tfoo",
+    ].join("\n");
+    expect(parsePmsetLog(out)).toEqual({ kind: "wake", at: Date.parse("2026-10-06T11:48:45-06:00") });
+    expect(parsePmsetLog(out.split("\n").slice(0, 3).join("\n"))?.kind).toBe("sleep");
+    expect(parsePmsetLog("garbage")).toBeUndefined();
+  });
+
+  describe("monitor", () => {
+    function mon(pmset = "") {
+      const calls: string[][] = [];
+      const alerts: string[] = [];
+      let t = 100_000_000;
+      const m = new TunnelMonitor({
+        port: 18800, tailscalePath: "/fake/ts", funnelPath: "/api/hooks/", probePath: "/api/hooks/ping",
+        probeViaPublicDns: false, pollSeconds: 60,
+        alert: async (x) => { alerts.push(x); },
+        now: () => t,
+        exec: async (cmd) => {
+          calls.push(cmd);
+          if (cmd[0] === "pmset") return { code: 0, stdout: pmset, stderr: "" };
+          // Tailscale app unreachable: always a failing reading.
+          if (cmd[1] === "status") return { code: 1, stdout: "", stderr: "no" };
+          return { code: 0, stdout: "", stderr: "" };
+        },
+      });
+      return { m, calls, alerts, advance: (ms: number) => { t += ms; } };
+    }
+
+    test("failures right after a sleep gap: no count, alert or remedy; alerts after grace", async () => {
+      const { m, calls, alerts, advance } = mon();
+      await m.tick();             // reading 1, normal cadence
+      advance(3_600_000);         // slept an hour
+      expect(await m.tick()).toContain("post-wake grace");
+      advance(60_000);
+      expect(await m.tick()).toContain("post-wake grace");
+      expect(m.getState().consecutiveFailures).toBe(0);
+      expect(alerts).toEqual([]);
+      expect(calls.some((c) => c[0] === "open")).toBe(false);
+      advance(60_000);
+      await m.tick();             // still inside the 3 min window
+      advance(60_000);
+      await m.tick();             // grace over, machine awake, still failing
+      expect(alerts.length).toBe(0);
+      expect(alerts.length).toBe(0); // reading 1 of 2
+      advance(60_000);
+      await m.tick();
+      expect(alerts.length).toBe(1);
+      expect(calls.some((c) => c.join(" ") === "open -g -a Tailscale")).toBe(true);
+    });
+
+    test("DarkWake per pmset suppresses even without a gap", async () => {
+      const now = 100_000_000;
+      const { m, alerts, advance } = mon(`${new Date(now - 20_000).toISOString().slice(0, 19).replace("T", " ")} +0000 DarkWake            \tx`);
+      await m.tick();
+      advance(60_000);
+      expect(await m.tick()).toContain("post-wake grace");
+      expect(alerts).toEqual([]);
+    });
   });
 });

@@ -190,6 +190,7 @@ export async function startServer() {
       funnelPath: t.funnelPath,
       probePath: t.probePath,
       probeViaPublicDns: t.probeViaPublicDns,
+      pollSeconds: t.pollSeconds,
       alert: async (text) => {
         const chat = t.alertChatId || getConfig().config.allowedUserId;
         const sent = await sendTelegram(getConfig().config.botToken, chat, text);

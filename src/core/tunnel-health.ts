@@ -295,3 +295,95 @@ export function funnelServesDaemon(
     ([mount, h]) => (!mountPath || mount === mountPath) && !!h.Proxy && target.test(h.Proxy),
   );
 }
+
+// --- Sleep awareness -------------------------------------------------------
+// A laptop in Power Nap wakes ("DarkWake") for a minute or two at a time with
+// the network half-up. Probe failures then say nothing about the tunnel, and
+// remedies/alerts just spam. These helpers decide when to stay quiet.
+
+/** How long after a detected wake failures are ignored. */
+export const WAKE_GRACE_MS = 3 * 60_000;
+/** A DarkWake line older than this is assumed stale (a Sleep/Wake line would have followed). */
+export const DARKWAKE_STALE_MS = 15 * 60_000;
+
+/**
+ * True when the wall-clock gap since the previous tick is far larger than the
+ * tick interval — the process was suspended. Strictly more than 2x interval.
+ */
+export function detectSleepGap(lastTickAt: number | undefined, now: number, intervalMs: number): boolean {
+  return lastTickAt !== undefined && now - lastTickAt > 2 * intervalMs;
+}
+
+export interface PowerEvent {
+  kind: "sleep" | "darkwake" | "wake";
+  /** epoch ms */
+  at: number;
+}
+
+/** Latest Sleep / DarkWake / Wake event in `pmset -g log` output, if any. */
+export function parsePmsetLog(stdout: string): PowerEvent | undefined {
+  const re = /^(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d) ([+-]\d\d)(\d\d) (Sleep|DarkWake|Wake)\s{2}/;
+  let last: PowerEvent | undefined;
+  for (const line of stdout.split("\n")) {
+    const m = re.exec(line);
+    if (!m) continue;
+    const at = Date.parse(`${m[1]}T${m[2]}${m[3]}:${m[4]}`);
+    if (!Number.isFinite(at)) continue;
+    last = { kind: m[5] === "Sleep" ? "sleep" : m[5] === "DarkWake" ? "darkwake" : "wake", at };
+  }
+  return last;
+}
+
+export interface WakeGraceState {
+  /** Wall-clock of the previous tick. */
+  lastTickAt?: number;
+  /** Failures are ignored until this time. */
+  graceUntil: number;
+}
+
+/**
+ * Decide whether `now` is inside a post-wake grace window or a DarkWake.
+ * Pure: takes the previous grace state, the optional pmset reading, returns
+ * the new state plus whether to stay quiet and whether this tick opened a
+ * fresh grace period (for the single log line).
+ */
+export function evaluateWakeGrace(
+  now: number,
+  prev: WakeGraceState,
+  intervalMs: number,
+  power?: PowerEvent,
+  graceMs: number = WAKE_GRACE_MS,
+): { state: WakeGraceState; quiet: boolean; reason?: "gap" | "darkwake" | "recent-wake"; fresh: boolean } {
+  let graceUntil = prev.graceUntil;
+  let reason: "gap" | "darkwake" | "recent-wake" | undefined;
+  const wasQuiet = now < prev.graceUntil;
+  if (detectSleepGap(prev.lastTickAt, now, intervalMs)) {
+    graceUntil = Math.max(graceUntil, now + graceMs);
+    reason = "gap";
+  }
+  if (power) {
+    const age = now - power.at;
+    if (power.kind === "darkwake" && age >= 0 && age < DARKWAKE_STALE_MS) {
+      reason ??= "darkwake";
+      graceUntil = Math.max(graceUntil, now + graceMs); // linger a full window after it ends
+    } else if (power.kind === "wake" && age >= 0 && age < graceMs) {
+      reason ??= "recent-wake";
+      graceUntil = Math.max(graceUntil, power.at + graceMs);
+    }
+  }
+  const quiet = now < graceUntil;
+  return {
+    state: { lastTickAt: now, graceUntil },
+    quiet,
+    ...(quiet ? { reason: reason ?? "gap" as const } : {}),
+    fresh: quiet && !wasQuiet,
+  };
+}
+
+/** Failing state discarded on entering grace, unless an alert is already out. */
+export function discardUnconfirmedFailures(prev: TunnelState): TunnelState {
+  if (prev.alertedProblem !== undefined) return prev;
+  const s = initialTunnelState();
+  if (prev.expiryWarnedAt !== undefined) s.expiryWarnedAt = prev.expiryWarnedAt;
+  return s;
+}
