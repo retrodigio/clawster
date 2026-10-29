@@ -76,8 +76,7 @@ export default function SessionDetailPage() {
   };
 
   const shortenPath = (p: string) => {
-    const home = '/Users/chriscrabtree/';
-    return p.startsWith(home) ? '~/' + p.slice(home.length) : p;
+    return p.replace(/^\/(Users|home)\/[^/]+\//, '~/');
   };
 
   return (

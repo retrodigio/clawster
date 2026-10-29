@@ -64,7 +64,7 @@ config/
   agents.json             # Agent definitions (development/reference copy)
   mcp-servers.json        # MCP server registry (open-brain; restricted-server ACL)
 daemon/
-  com.claude.open-brain.plist  # launchd plist for the Open Brain MCP server
+  com.claude.open-brain.plist  # launchd plist for the Open Brain MCP server (replace /Users/YOU before installing)
 scripts/
   discover-chats.ts       # Chat ID discovery helper
   migrate-workspaces.ts   # Migration from OpenClaw workspace files
@@ -147,7 +147,7 @@ Environment variable overrides: `CLAWSTER_BOT_TOKEN`, `CLAWSTER_USER_ID`, `CLAWS
     {
       "id": "main",
       "name": "Zero",
-      "workspace": "/Users/chriscrabtree/claude-orchestrator",
+      "workspace": "/Users/you/claude-orchestrator",
       "telegramChatId": "-1001000000003",
       "isDefault": true,
       "heartbeat": {
@@ -159,7 +159,7 @@ Environment variable overrides: `CLAWSTER_BOT_TOKEN`, `CLAWSTER_USER_ID`, `CLAWS
     {
       "id": "ironrod",
       "name": "IronRod",
-      "workspace": "/Users/chriscrabtree/projects/ironrod",
+      "workspace": "/Users/you/projects/ironrod",
       "telegramChatId": "-1001000000004",
       "topics": {
         "11": { "name": "Issues" }
@@ -211,7 +211,7 @@ Add an entry to the `agents` array in `~/.clawster/agents.json`:
 {
   "id": "myproject",
   "name": "MyProject",
-  "workspace": "/Users/chriscrabtree/projects/myproject",
+  "workspace": "/Users/you/projects/myproject",
   "telegramChatId": "-100XXXXXXXXXX"
 }
 ```
@@ -485,18 +485,9 @@ Flags: `Z` = compress with gzip, `N` = don't signal any process (launchd keeps t
 
 ## Current Agent Fleet
 
-This machine runs the following agents (see agents.json for full config):
-- **Zero** (main) — This agent. Manages Clawster itself.
-- **IronRod** — /Users/chriscrabtree/projects/ironrod
-- **LetterGnome** — /Users/chriscrabtree/projects/lettergnome
-- **TileMap** — /Users/chriscrabtree/projects/tilemap
-- **Sinigate** — /Users/chriscrabtree/projects/sinigate
-- **Regex** — /Users/chriscrabtree/projects/regex
-- **Gnomium** — /Users/chriscrabtree/projects/gnomium
-- **JobArbiter** — /Users/chriscrabtree/projects/jobarbiter
-- **Once Upon a Rhyme** — /Users/chriscrabtree/projects/storytime
-- **Fisherman's Wife** — /Users/chriscrabtree/projects/fishermans-wife
-- **SocialManager** — /Users/chriscrabtree/projects/social-manager
+The live fleet is defined in `~/.clawster/agents.json` on the host machine — run
+`clawster agent list` to see it. It is deliberately not listed here: this repo is
+public, and the roster (names, workspaces, chat bindings) is operator data.
 
 ## Session Startup
 

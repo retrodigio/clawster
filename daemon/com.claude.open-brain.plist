@@ -8,11 +8,11 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/usr/local/opt/node@22/bin/node</string>
-		<string>/Users/chriscrabtree/projects/open-brain/dist/mcp/server.js</string>
+		<string>/Users/YOU/projects/open-brain/dist/mcp/server.js</string>
 	</array>
 
 	<key>WorkingDirectory</key>
-	<string>/Users/chriscrabtree/projects/open-brain</string>
+	<string>/Users/YOU/projects/open-brain</string>
 
 	<key>RunAtLoad</key>
 	<true/>
@@ -28,13 +28,13 @@
 		<key>PATH</key>
 		<string>/usr/local/opt/node@22/bin:/usr/local/bin:/usr/bin:/bin</string>
 		<key>HOME</key>
-		<string>/Users/chriscrabtree</string>
+		<string>/Users/YOU</string>
 	</dict>
 
 	<key>StandardOutPath</key>
-	<string>/Users/chriscrabtree/Library/Logs/open-brain.log</string>
+	<string>/Users/YOU/Library/Logs/open-brain.log</string>
 
 	<key>StandardErrorPath</key>
-	<string>/Users/chriscrabtree/Library/Logs/open-brain.error.log</string>
+	<string>/Users/YOU/Library/Logs/open-brain.error.log</string>
 </dict>
 </plist>

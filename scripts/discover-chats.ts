@@ -8,10 +8,10 @@
 import { Bot } from "grammy";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "123456789";
+const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
 
-if (!BOT_TOKEN) {
-  console.error("Set TELEGRAM_BOT_TOKEN in .env");
+if (!BOT_TOKEN || !ALLOWED_USER_ID) {
+  console.error("Set TELEGRAM_BOT_TOKEN and TELEGRAM_USER_ID in .env");
   process.exit(1);
 }
 

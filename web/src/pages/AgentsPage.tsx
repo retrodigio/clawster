@@ -94,7 +94,7 @@ export default function AgentsPage() {
                     type="text"
                     value={newWorkspace}
                     onChange={(e) => setNewWorkspace(e.target.value)}
-                    placeholder="/Users/chriscrabtree/projects/myproject"
+                    placeholder="~/projects/myproject"
                     className="bg-terminal-bg border border-terminal-border rounded-md px-3 py-2 w-full text-xs text-terminal-fg focus:outline-none focus:border-terminal-accent"
                   />
                 </div>
@@ -160,7 +160,7 @@ export default function AgentsPage() {
                     )}
                   </td>
                   <td className="px-3 py-2 text-terminal-muted">
-                    {agent.workspace.replace('/Users/chriscrabtree/', '~/')}
+                    {agent.workspace.replace(/^\/(Users|home)\/[^/]+\//, '~/')}
                   </td>
                   <td className="px-3 py-2 text-terminal-muted">
                     {agent.telegramChatId}

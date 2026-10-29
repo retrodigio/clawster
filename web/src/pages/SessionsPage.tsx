@@ -17,9 +17,7 @@ function relativeTime(dateStr: string | null): string {
 }
 
 function shortenPath(path: string): string {
-  const home = '/Users/chriscrabtree/';
-  if (path.startsWith(home)) return '~/' + path.slice(home.length);
-  return path;
+  return path.replace(/^\/(Users|home)\/[^/]+\//, '~/');
 }
 
 type AgentStatus = 'running' | 'has-session' | 'idle';
