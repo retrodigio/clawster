@@ -77,7 +77,10 @@ export async function mutateAgents(
   mutator: (agents: AgentsConfig) => void | Promise<void>,
 ): Promise<LoadedConfig> {
   const task = writeChain.then(async () => {
-    const clone = structuredClone(getConfig().agents);
+    // Re-read from disk first: agents.json is also edited outside the daemon
+    // (add-telegram-project.sh, an operator at a terminal). Cloning the stale
+    // in-memory copy here silently dropped an agent added that way (2026-10-30).
+    const clone = structuredClone(applyLoaded(await loadConfig()).agents);
     await mutator(clone);
     await saveAgents(clone); // validates schema + atomic write
     return reloadConfigStore();
