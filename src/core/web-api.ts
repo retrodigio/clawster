@@ -1,5 +1,6 @@
 import { join } from "path";
-import { readdir } from "fs/promises";
+import { readdir, readFile, appendFile, mkdir } from "fs/promises";
+import { homedir } from "os";
 import { log } from "./logger.ts";
 import {
   getClawsterHome,
@@ -9,6 +10,7 @@ import {
 } from "./config.ts";
 import { mutateAgents } from "./config-store.ts";
 import { checkAgentTask, upsertTask, removeTask, describeTaskChange, MAX_TASKS_PER_AGENT } from "./task-policy.ts";
+import { checkProposal, describeProposal, parseProposals, type Decision } from "./proposal-policy.ts";
 import { sendTelegram } from "./scheduler.ts";
 import { getSession, clearSession } from "./session-store.ts";
 import type { AgentConfig } from "./types.ts";
@@ -571,6 +573,51 @@ export function startWebApi(options: WebApiOptions) {
       }
 
       return withCors(err("Use GET …/tasks, PUT …/tasks/:name, or DELETE …/tasks/:name", 405));
+    }
+
+    // /api/agents/:id/proposals — an agent proposing what it could do next (the board's Up next).
+    //
+    // Append-only: a card goes into ~/.clawster/proposals/<id>.jsonl after proposal-policy.ts checks it (schema, own chat
+    // only, no links, the daily and open limits, dedupe), and is announced in the agent's own group. Chris's decisions
+    // come back through the orchestrator into proposals-state.json, which this route only reads. This is the path
+    // `clawster propose` uses. It never touches the registry.
+    const proposalRoute = path.match(/^\/api\/agents\/([^/]+)\/proposals$/);
+    if (proposalRoute) {
+      const id = decodeURIComponent(proposalRoute[1]!);
+      const agent = currentConfig().agents.agents.find((a) => a.id === id);
+      if (!agent) return withCors(err("Agent not found", 404));
+      if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(id)) return withCors(err("This agent id can't file proposals", 400));
+      const dir = join(getClawsterHome(), "proposals");
+      const file = join(dir, `${id}.jsonl`);
+      const existing = parseProposals(await readFile(file, "utf-8").catch(() => ""));
+      const stateFile = process.env.CLAWSTER_PROPOSAL_STATE || join(homedir(), ".claude", "channels", "telegram", "proposals-state.json");
+      let decisions: Record<string, Decision> = {};
+      try { decisions = JSON.parse(await readFile(stateFile, "utf-8")) ?? {}; } catch { /* none yet */ }
+
+      if (method === "GET") return withCors(json({ agentId: id, proposals: existing, decisions: Object.fromEntries(existing.filter((c) => decisions[c.id]).map((c) => [c.id, decisions[c.id]])) }));
+
+      if (method === "POST") {
+        const body = await parseBody<Record<string, unknown>>(req);
+        if (!body) return withCors(err("Invalid body"));
+        const check = checkProposal(agent, body, existing, decisions, Date.now());
+        if (!check.ok) return withCors(err(check.error, 400));
+        try {
+          await mkdir(dir, { recursive: true, mode: 0o700 });
+          await appendFile(file, JSON.stringify(check.card) + "\n", { mode: 0o600 });
+        } catch (e) {
+          return withCors(err(`Could not save the proposal: ${e instanceof Error ? e.message : e}`, 500));
+        }
+        try {
+          const sent = await sendTelegram(currentConfig().config.botToken, agent.telegramChatId, describeProposal(agent, check.card, check.replaced));
+          if (!sent.ok) log.warn("web-api", "Proposal notice not delivered", { agent: id, proposal: check.card.id });
+        } catch (e) {
+          log.warn("web-api", "Proposal notice failed", { agent: id, error: String(e) });
+        }
+        log.info("web-api", check.replaced ? "Proposal updated" : "Proposal filed", { agent: id, proposal: check.card.id, kind: check.card.kind });
+        return withCors(json({ agentId: id, action: check.replaced ? "updated" : "filed", proposal: check.card }));
+      }
+
+      return withCors(err("Use GET …/proposals or POST …/proposals", 405));
     }
 
     // PUT/PATCH /api/agents/:id — update agent (web client sends PATCH)

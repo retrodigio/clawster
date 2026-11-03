@@ -29,6 +29,7 @@ import { migrateCommand } from "./migrate.ts";
 import { msgCommand } from "./msg.ts";
 import { browserCommand } from "./browser.ts";
 import { taskCommand } from "./task.ts";
+import { proposeCommand } from "./propose.ts";
 
 program.addCommand(initCommand);
 program.addCommand(startCommand);
@@ -43,6 +44,7 @@ program.addCommand(migrateCommand);
 program.addCommand(msgCommand);
 program.addCommand(browserCommand);
 program.addCommand(taskCommand);
+program.addCommand(proposeCommand);
 
 // parseAsync so errors thrown in async command actions surface as clean
 // messages instead of unhandled-rejection stack traces.
